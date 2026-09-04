@@ -245,6 +245,11 @@ Item {
     return id
   }
 
+  function openUrl(url) {
+    if (!root.helperReady || !String(url || "")) return ""
+    root.send({ cmd: "open_url", url: String(url) })
+  }
+
   function saveServer(server) {
     return root.send({ cmd: "save_server", server: server })
   }

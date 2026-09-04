@@ -88,6 +88,7 @@ Panel {
     var row = root.selectedRow()
     if (!row) return
     root.expandedKey = root.expandedKey === row.notificationKey ? "" : row.notificationKey
+    Qt.callLater(function() { feed.positionViewAtIndex(root.selectedIndex, ListView.Contain) })
   }
 
   function markSelectedRead() {
@@ -422,6 +423,9 @@ Panel {
                 }
                 onMediaRequested: function(notificationKey, kind) {
                   if (root.ntfyService) root.ntfyService.fetchMedia(notificationKey, kind)
+                }
+                onOpenUrlRequested: function(url) {
+                  if (root.ntfyService) root.ntfyService.openUrl(url)
                 }
               }
             }

@@ -83,3 +83,22 @@ test("actionDisplay exposes method and host, not headers", () => {
   assert.equal(model.actionDisplay({ action: "http", method: "", url: "https://example.com:8443/do" }), "POST example.com:8443");
   assert.equal(model.actionDisplay({ action: "copy" }), "Copy");
 });
+
+test("extractLinks finds urls, trims punctuation, and dedupes", () => {
+  const links = model.extractLinks("See https://a.com/x. and https://a.com/x. plus http://b.org/y");
+  assert.deepEqual(Array.from(links, link => link.url), ["https://a.com/x", "http://b.org/y"]);
+  assert.equal(model.extractLinks("no links here").length, 0);
+});
+
+test("shortenUrl keeps host and elides long paths", () => {
+  assert.equal(model.shortenUrl("https://github.com/a/b"), "github.com/a/b");
+  assert.equal(model.shortenUrl("https://github.com/a/very/long/path", 20), "github.com/a/very/l\u2026");
+  assert.equal(model.shortenUrl("not a url", 10), "not a url");
+});
+
+test("shortenText replaces urls in prose and preserves trailing punctuation", () => {
+  assert.equal(model.shortenText("See https://github.com/a/b now."), "See github.com/a/b now.");
+  assert.equal(model.shortenText("plain text"), "plain text");
+  assert.equal(model.shortenText("Go to https://github.com/a/very/long/path/with/many/more/segments"),
+  "Go to github.com/a/very/long/path/with/many/more/segm\u2026");
+});

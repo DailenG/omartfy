@@ -27,8 +27,7 @@ BarWidget {
   }).length
   readonly property color iconColor: dndActive
     ? Util.alpha(bar ? bar.foreground : Color.foreground, 0.55)
-    : (urgentUnreadCount > 0 ? Color.urgent
-      : (unreadCount > 0 ? Color.accent : (bar ? bar.foreground : Color.foreground)))
+    : (bar ? bar.foreground : Color.foreground)
   readonly property string badgeText: unreadCount > 99 ? "99+" : String(unreadCount)
 
   function open() {
@@ -103,6 +102,7 @@ BarWidget {
         Image {
           id: mark
           anchors.fill: parent
+          anchors.margins: Style.space(2)
           source: Qt.resolvedUrl("assets/ntfy-mask.svg")
           fillMode: Image.PreserveAspectFit
           sourceSize.width: Math.round(width * Screen.devicePixelRatio)
@@ -205,8 +205,8 @@ BarWidget {
     visible: root.unreadCount > 0 && !root.dndActive
     anchors.right: parent.right
     anchors.top: parent.top
-    anchors.rightMargin: -Style.space(2)
-    anchors.topMargin: -Style.space(2)
+    anchors.rightMargin: Style.space(1)
+    anchors.topMargin: Style.space(1)
     radius: height / 2
     color: root.urgentUnreadCount > 0 ? Color.urgent : Color.accent
     implicitWidth: Math.max(implicitHeight, badgeLabel.implicitWidth + Style.space(4))

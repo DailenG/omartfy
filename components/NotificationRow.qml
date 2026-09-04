@@ -23,11 +23,13 @@ CursorSurface {
   signal deleteRequested(string notificationKey)
   signal actionRequested(string notificationKey, var action)
   signal mediaRequested(string notificationKey, string kind)
+  signal openUrlRequested(string url)
 
   readonly property var priority: Model.priorityMeta(notification.priority)
   readonly property var attachment: notification.attachment || ({})
   readonly property bool hasAttachment: !!attachment.url
   readonly property var notificationActions: notification.actions || []
+  readonly property var messageLinks: Model.extractLinks(notification.message)
   readonly property bool attachmentExpired: Number(attachment.expires || notification.expires || 0) > 0
     && Number(attachment.expires || notification.expires) <= Math.floor(Date.now() / 1000)
   readonly property var iconMediaState: service
@@ -135,6 +137,7 @@ CursorSurface {
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: root.notification.unread
+            textFormat: Text.PlainText
             elide: Text.ElideRight
             maximumLineCount: 1
           }
@@ -181,6 +184,7 @@ CursorSurface {
           color: Util.alpha(root.foreground, 0.78)
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
+          textFormat: Text.PlainText
           elide: Text.ElideRight
           maximumLineCount: 1
         }
@@ -206,14 +210,30 @@ CursorSurface {
       Text {
         width: parent.width
         visible: String(root.notification.message || "").length > 0
-        text: String(root.notification.message || "")
+        text: Model.shortenText(String(root.notification.message || ""))
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
-        maximumLineCount: 6
-        elide: Text.ElideRight
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
+      }
+
+      Flow {
+        width: parent.width
+        height: visible ? childrenRect.height : 0
+        visible: root.messageLinks.length > 0
+        spacing: Style.space(7)
+
+        Repeater {
+          model: root.messageLinks
+          delegate: Button {
+            required property var modelData
+            text: modelData.label
+            tooltipText: modelData.url
+            fontSize: Style.font.caption
+            onClicked: root.openUrlRequested(modelData.url)
+          }
+        }
       }
 
       Text {

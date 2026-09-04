@@ -1506,6 +1506,14 @@ class Bridge:
             self.delete_server(request_id, str(command.get("serverId") or ""))
         elif name == "test_server":
             self.test_server(request_id, command.get("server"))
+        elif name == "open_url":
+            try:
+                url = validate_web_url(command.get("url"))
+            except ValueError as error:
+                self.emit({"event": "error", "fatal": False, "message": str(error)})
+            else:
+                subprocess.Popen(["omarchy-launch-browser", url], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             self.emit({"event": "error", "fatal": False, "message": "Unknown bridge command"})
 

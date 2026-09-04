@@ -12,6 +12,7 @@ import time
 import unittest
 import urllib.parse
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -637,6 +638,22 @@ class BridgeCase(unittest.TestCase):
         self.assertEqual(result["event"], "config_result")
         self.assertTrue(result["ok"])
         self.assertTrue(any(event["event"] == "snapshot" and event["servers"] for event in events[1:]))
+
+    def test_open_url_validates_scheme_and_launches_browser(self):
+        bridge = self.make_bridge({"version": 1, "servers": []})
+        launched = []
+
+        def fake_popen(argv, **kwargs):
+            launched.append(list(argv))
+
+        with mock.patch.object(bridge_module.subprocess, "Popen", side_effect=fake_popen):
+            bridge.handle_command({"cmd": "open_url", "url": "https://example.com/path"})
+        self.assertEqual(launched, [["omarchy-launch-browser", "https://example.com/path"]])
+
+        bridge.handle_command({"cmd": "open_url", "url": "javascript:alert(1)"})
+        self.assertEqual(len(launched), 1)
+        error = next(event for event in self.events() if event.get("event") == "error")
+        self.assertIn("Only HTTP and HTTPS", error["message"])
 
 
 if __name__ == "__main__":

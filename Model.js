@@ -132,3 +132,44 @@ function actionDisplay(action) {
   if (type === "view") return "Open"
   return ""
 }
+
+function extractLinks(text) {
+  var source = String(text || "")
+  var matches = source.match(/https?:\/\/[^\s<>"'`\u2026]+/g) || []
+  var seen = {}
+  var links = []
+  for (var index = 0; index < matches.length; index++) {
+    var raw = matches[index].replace(/[.,;:!?]+$/, "")
+    if (!raw || seen[raw]) continue
+    seen[raw] = true
+    links.push({ url: raw, label: shortenUrl(raw) })
+  }
+  return links
+}
+
+function shortenUrl(url, maxLength) {
+  var limit = Number(maxLength) || 48
+  var text = String(url || "")
+  try {
+    var parsed = new URL(text)
+    var host = parsed.host
+    var path = parsed.pathname + parsed.search
+    var label = host + path
+    if (label.length > limit) {
+      var keep = limit - host.length - 1
+      label = keep > 0 ? host + path.slice(0, keep) : host
+      label += "\u2026"
+    }
+    return label
+  } catch (error) {
+    return text.length > limit ? text.slice(0, limit - 1) + "\u2026" : text
+  }
+}
+
+function shortenText(text) {
+  return String(text || "").replace(/https?:\/\/[^\s<>"'`\u2026]+/g, function(raw) {
+    var stripped = raw.replace(/[.,;:!?]+$/, "")
+    if (!stripped) return raw
+    return shortenUrl(stripped) + raw.slice(stripped.length)
+  })
+}
