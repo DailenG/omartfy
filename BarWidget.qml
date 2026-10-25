@@ -25,10 +25,12 @@ BarWidget {
   readonly property int connectedCount: servers.filter(function(server) {
     return server.enabled !== false && server.state === "connected"
   }).length
+  readonly property color barTextColor: bar
+    ? (bar.barForeground !== undefined ? bar.barForeground : bar.foreground)
+    : Color.foreground
   readonly property color iconColor: dndActive
-    ? Util.alpha(bar ? bar.foreground : Color.foreground, 0.55)
-    : (urgentUnreadCount > 0 ? Color.urgent
-      : (unreadCount > 0 ? Color.accent : (bar ? bar.foreground : Color.foreground)))
+    ? Util.alpha(barTextColor, 0.55)
+    : (urgentUnreadCount > 0 ? Color.urgent : barTextColor)
   readonly property string badgeText: unreadCount > 99 ? "99+" : String(unreadCount)
 
   function open() {
@@ -61,6 +63,12 @@ BarWidget {
   function setMute(durationSeconds) {
     if (root.ntfyService) root.ntfyService.setMute(durationSeconds)
     root.dndPopupOpen = false
+  }
+
+  function untilTomorrowSeconds() {
+    var now = new Date()
+    var target = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 8, 0, 0, 0)
+    return Math.max(3600, Math.ceil((target.getTime() - now.getTime()) / 1000))
   }
 
   function injectPanel() {
@@ -103,6 +111,7 @@ BarWidget {
         Image {
           id: mark
           anchors.fill: parent
+          anchors.margins: Style.space(2)
           source: Qt.resolvedUrl("assets/ntfy-mask.svg")
           fillMode: Image.PreserveAspectFit
           sourceSize.width: Math.round(width * Screen.devicePixelRatio)
@@ -126,6 +135,7 @@ BarWidget {
           anchors.centerIn: parent
           visible: mark.status === Image.Error
           text: "󰂚"
+          textFormat: Text.PlainText
           color: root.iconColor
           font.family: button.fontFamily
           font.pixelSize: button.fontSize
@@ -166,7 +176,8 @@ BarWidget {
 
       Text {
         text: root.dndStatus()
-        color: root.bar ? root.bar.foreground : Color.foreground
+        textFormat: Text.PlainText
+        color: Color.foreground
         font.family: button.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
@@ -189,6 +200,11 @@ BarWidget {
       }
       Button {
         width: parent.width
+        text: "Mute until tomorrow"
+        onClicked: root.setMute(root.untilTomorrowSeconds())
+      }
+      Button {
+        width: parent.width
         text: "Mute until turned off"
         onClicked: root.setMute(-1)
       }
@@ -205,8 +221,8 @@ BarWidget {
     visible: root.unreadCount > 0 && !root.dndActive
     anchors.right: parent.right
     anchors.top: parent.top
-    anchors.rightMargin: -Style.space(2)
-    anchors.topMargin: -Style.space(2)
+    anchors.rightMargin: Style.space(1)
+    anchors.topMargin: Style.space(1)
     radius: height / 2
     color: root.urgentUnreadCount > 0 ? Color.urgent : Color.accent
     implicitWidth: Math.max(implicitHeight, badgeLabel.implicitWidth + Style.space(4))
@@ -216,6 +232,7 @@ BarWidget {
       id: badgeLabel
       anchors.centerIn: parent
       text: root.badgeText
+      textFormat: Text.PlainText
       color: Color.background
       font.family: button.fontFamily
       font.pixelSize: Style.space(8)
@@ -228,7 +245,8 @@ BarWidget {
     anchors.right: parent.right
     anchors.bottom: parent.bottom
     text: "z"
-    color: bar ? bar.foreground : Color.foreground
+    textFormat: Text.PlainText
+    color: root.barTextColor
     font.family: button.fontFamily
     font.pixelSize: Style.space(8)
     font.bold: true

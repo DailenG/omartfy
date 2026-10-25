@@ -175,7 +175,6 @@ Item {
     httpActionsCheck.checked = server.allowHttpActions === true
     externalMediaCheck.checked = server.allowExternalMedia === true
     insecureCheck.checked = server.allowInsecureHttp === true
-    var type = String((server.auth || {}).type || "none")
     authTypeBox.currentIndex = Math.max(0, ["none", "token", "basic"].indexOf(type))
     usernameField.text = String((server.auth || {}).username || "")
     secretField.text = ""
@@ -275,6 +274,7 @@ Item {
         Text {
           anchors.verticalCenter: parent.verticalCenter
           text: "Settings"
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.title
@@ -295,12 +295,12 @@ Item {
 
         Text {
           text: "Desktop notifications"
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           font.bold: true
         }
-
         CheckBox {
           id: nativeToastsCheck
           text: "Show native Omarchy toasts"
@@ -312,6 +312,7 @@ Item {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "Duration"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -340,6 +341,7 @@ Item {
           width: parent.width
           visible: root.toastResultText.length > 0
           text: root.toastResultText
+          textFormat: Text.PlainText
           color: root.toastResultText === "Saved" ? Color.accent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -349,6 +351,7 @@ Item {
         Text {
           width: parent.width
           text: "Omarchy default follows ntfy priority. Finite choices use the exact lifetime; until dismissed requires manual close. Omartfy DND and Omarchy notification DND suppress popups while the inbox keeps collecting."
+          textFormat: Text.PlainText
           color: root.foreground
           opacity: 0.72
           font.family: root.fontFamily
@@ -365,6 +368,7 @@ Item {
 
         Text {
           text: "Header action"
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -377,6 +381,7 @@ Item {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "Action button"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -401,6 +406,7 @@ Item {
           width: parent.width
           visible: root.batchActionResultText.length > 0
           text: root.batchActionResultText
+          textFormat: Text.PlainText
           color: root.batchActionResultText === "Saved" ? Color.accent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -410,6 +416,7 @@ Item {
         Text {
           width: parent.width
           text: "Controls whether the panel header button deletes all notifications in the active view (with confirmation) or marks them all as read."
+          textFormat: Text.PlainText
           color: root.foreground
           opacity: 0.72
           font.family: root.fontFamily
@@ -417,6 +424,7 @@ Item {
           wrapMode: Text.Wrap
         }
       }
+
       PanelSeparator { width: parent.width }
 
       Column {
@@ -434,9 +442,9 @@ Item {
 
             Button {
               width: Math.max(0, serverRow.width - editButton.implicitWidth - serverRow.spacing)
-              text: String(serverRow.modelData.label || "Server") + "  ·  "
-                + String(serverRow.modelData.state
-                  || (serverRow.modelData.enabled ? "connecting" : "disabled"))
+              text: Model.plainText(serverRow.modelData.label || "Server", 64) + "  ·  "
+                + Model.plainText(serverRow.modelData.state
+                  || (serverRow.modelData.enabled ? "connecting" : "disabled"), 32)
               onClicked: root.serverSelected(String(serverRow.modelData.id || ""))
             }
 
@@ -461,6 +469,7 @@ Item {
 
         Text {
           text: root.editingId ? "Edit server" : "Add server"
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -470,12 +479,14 @@ Item {
         TextField {
           id: labelField
           width: parent.width
+          maximumLength: 64
           placeholderText: "Label"
         }
 
         TextField {
           id: baseUrlField
           width: parent.width
+          maximumLength: 2048
           placeholderText: "https://ntfy.example.com"
           text: "https://ntfy.sh"
         }
@@ -483,6 +494,7 @@ Item {
         TextField {
           id: topicsField
           width: parent.width
+          maximumLength: 1024
           placeholderText: "alerts, backups"
         }
 
@@ -510,6 +522,7 @@ Item {
           Text {
             anchors.verticalCenter: parent.verticalCenter
             text: "Authentication"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -524,6 +537,7 @@ Item {
           id: usernameField
           width: parent.width
           visible: root.authType() === "basic"
+          maximumLength: 256
           placeholderText: "Username"
         }
 
@@ -531,6 +545,7 @@ Item {
           id: secretField
           width: parent.width
           visible: root.authType() !== "none"
+          maximumLength: 4096
           echoMode: TextInput.Password
           placeholderText: root.editingId ? "Secret (blank preserves current)"
             : (root.authType() === "token" ? "Access token" : "Password")
@@ -547,6 +562,7 @@ Item {
           width: parent.width
           visible: root.validationError().length > 0
           text: root.validationError()
+          textFormat: Text.PlainText
           color: Color.urgent
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -557,6 +573,7 @@ Item {
           width: parent.width
           visible: root.resultText.length > 0
           text: root.resultText
+          textFormat: Text.PlainText
           color: root.resultText === "Saved" || root.resultText === "Connection succeeded"
             ? Color.accent : root.foreground
           font.family: root.fontFamily

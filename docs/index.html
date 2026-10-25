@@ -67,7 +67,7 @@
         <article><span class="feature-index">04</span><h3>Quiet when needed</h3><p>Right-click the bar icon for timed or indefinite DND. Messages continue collecting while badges and urgency stay muted.</p></article>
         <article><span class="feature-index">05</span><h3>Native Omarchy toasts</h3><p>Opt in to desktop toasts with custom duration, per-server switches, DND respect, and click-to-open integration.</p></article>
         <article><span class="feature-index">06</span><h3>Restart-safe state</h3><p>Cursors, deduplication, local read/delete state, and DND survive Omarchy shell restarts without changing ntfy upstream.</p></article>
-        <article><span class="feature-index">07</span><h3>Same-origin media</h3><p>Useful icons and previews load lazily and are strictly restricted to the configured server's origin across all redirects.</p></article>
+        <article><span class="feature-index">07</span><h3>Guarded media</h3><p>Icons and previews load lazily from the configured server's origin by default, with an explicit per-server opt-in for public HTTPS hosts.</p></article>
       </div>
     </section>
 
@@ -108,7 +108,7 @@
         <h2>Credentials stay out of URLs and process arguments.</h2>
       </div>
       <div class="security-copy">
-        <p>Configuration and state are written atomically with restrictive permissions. TLS verification is never disabled. HTTP actions require per-server opt-in, automatic media is same-origin only, and desktop toasts are opt-in.</p>
+        <p>Configuration and state are written atomically with restrictive permissions. TLS verification is never disabled. HTTP actions and external-host images require per-server opt-in, and desktop toasts are opt-in.</p>
         <a href="https://github.com/DailenG/omartfy/blob/main/SECURITY.md">Read the security policy →</a>
       </div>
     </section>

@@ -16,6 +16,7 @@ Item {
   property bool helperReady: false
   property bool shuttingDown: false
   property int nextRequestNumber: 1
+  property int restartDelayMs: 1000
   property var actionStates: ({})
   property var mediaStates: ({})
   property var toastSettings: ({ enabled: false, duration: "default" })
@@ -89,8 +90,30 @@ Item {
     root.nowMs = Date.now()
     root.muteUntil = Number(message.muteUntil || 0)
     root.helperReady = true
+    root.restartDelayMs = 1000
     root.lastError = ""
+    root.pruneTransientStates()
     root.updateDerived()
+  }
+
+  function pruneTransientStates() {
+    var valid = Object.create(null)
+    for (var i = 0; i < root.notifications.length; i++) {
+      var row = root.notifications[i]
+      if (row && row.notificationKey) valid[String(row.notificationKey)] = true
+    }
+    var nextActions = ({})
+    for (var aKey in root.actionStates) {
+      var aPrefix = aKey.split("\u0000", 1)[0]
+      if (valid[aPrefix]) nextActions[aKey] = root.actionStates[aKey]
+    }
+    root.actionStates = nextActions
+    var nextMedia = ({})
+    for (var mKey in root.mediaStates) {
+      var mPrefix = mKey.split("\u0000", 1)[0]
+      if (valid[mPrefix]) nextMedia[mKey] = root.mediaStates[mKey]
+    }
+    root.mediaStates = nextMedia
   }
 
   function upsertNotification(notification) {
@@ -113,6 +136,7 @@ Item {
     root.notifications = root.notifications.filter(function(row) {
       return row.notificationKey !== notificationKey
     })
+    root.pruneTransientStates()
     root.updateDerived()
   }
 
@@ -245,6 +269,16 @@ Item {
     return id
   }
 
+  function openUrl(url) {
+    if (!root.helperReady || !String(url || "")) return ""
+    return root.send({ cmd: "open_url", url: String(url) })
+  }
+
+  function copyText(text) {
+    if (!root.helperReady || !String(text || "")) return ""
+    return root.send({ cmd: "copy_text", text: String(text) })
+  }
+
   function saveServer(server) {
     return root.send({ cmd: "save_server", server: server })
   }
@@ -281,7 +315,7 @@ Item {
 
   Process {
     id: bridgeProcess
-    command: ["setpriv", "--pdeathsig", "TERM", "python3", root.helperPath]
+    command: ["/usr/bin/setpriv", "--pdeathsig", "TERM", "/usr/bin/python3", "-I", "-B", root.helperPath]
     stdinEnabled: true
     running: true
 
@@ -304,7 +338,11 @@ Item {
     onExited: function(exitCode) {
       root.helperReady = false
       root.overallStatus = "error"
-      if (!root.shuttingDown) restartTimer.restart()
+      if (!root.shuttingDown) {
+        restartTimer.interval = root.restartDelayMs
+        root.restartDelayMs = Math.min(30000, root.restartDelayMs * 2)
+        restartTimer.restart()
+      }
     }
   }
 

@@ -22,12 +22,13 @@ Panel {
   property int selectedIndex: 0
   property string expandedKey: ""
   property bool searchOpen: false
+  property bool unreadOnly: false
   property bool editorOpen: false
   property double nowMs: Date.now()
   readonly property string searchQuery: searchOpen ? searchField.text : ""
   readonly property var servers: ntfyService ? ntfyService.servers : []
   readonly property var notifications: ntfyService ? ntfyService.notifications : []
-  readonly property var visibleRows: Model.filterRows(notifications, selectedServerId, searchQuery)
+  readonly property var visibleRows: Model.filterRows(notifications, selectedServerId, searchQuery, unreadOnly)
   readonly property var tabState: Model.tabLayout(servers, selectedServerId, 3)
   readonly property bool nestedOpen: searchOpen || editorOpen || serverMorePopup.opened
     || clearPopup.opened
@@ -99,6 +100,7 @@ Panel {
     var row = root.selectedRow()
     if (!row) return
     root.expandedKey = root.expandedKey === row.notificationKey ? "" : row.notificationKey
+    Qt.callLater(function() { feed.positionViewAtIndex(root.selectedIndex, ListView.Contain) })
   }
 
   function markSelectedRead() {
@@ -107,11 +109,17 @@ Panel {
       root.ntfyService.markNotificationRead(row.notificationKey)
   }
 
+  function copySelected() {
+    var row = root.selectedRow()
+    if (!row || !root.ntfyService) return
+    var text = String(row.message || row.title || "")
+    if (text) root.ntfyService.copyText(text)
+  }
+
   function deleteSelected() {
     var row = root.selectedRow()
     if (row && root.ntfyService) root.ntfyService.deleteNotification(row.notificationKey)
   }
-
   function openSpecial(actionId) {
     var row = root.selectedRow()
     if (!row || !root.ntfyService) return
@@ -129,12 +137,23 @@ Panel {
     } else if (text === "/") {
       root.searchOpen = true
       Qt.callLater(function() { searchField.forceActiveFocus() })
+    } else if (text === "u") {
+      root.unreadOnly = !root.unreadOnly
+    } else if (text === "c" || text === "y") {
+      root.copySelected()
     } else if (text === "o") root.openSpecial("__click")
     else if (text === "a") root.openSpecial("__attachment")
     else if (text === "e") root.toggleSelected()
     else if (text === "d") root.deleteSelected()
     else if (text === "1" || text === "2" || text === "3")
       root.performVisibleAction(Number(text) - 1)
+  }
+
+  function performVisibleAction(actionIndex) {
+    var row = root.selectedRow()
+    if (!row || !root.ntfyService || !Array.isArray(row.actions)) return
+    var action = row.actions[actionIndex]
+    if (action) root.ntfyService.performAction(row.notificationKey, action)
   }
 
   onVisibleRowsChanged: {
@@ -232,6 +251,7 @@ Panel {
 
             Text {
               text: "Notifications"
+              textFormat: Text.PlainText
               color: root.contentForeground
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.title
@@ -242,20 +262,27 @@ Panel {
               width: parent.width
               text: Model.serverSummary(root.servers,
                 root.ntfyService ? root.ntfyService.unreadCount : 0)
+              textFormat: Text.PlainText
               color: Util.alpha(root.contentForeground, 0.62)
               font.family: root.contentFontFamily
               font.pixelSize: Style.font.caption
               elide: Text.ElideRight
             }
           }
-
           Row {
             id: headerActions
             spacing: Style.space(4)
 
             Button {
               text: "↻"
+              tooltipText: "Reload (r)"
               onClicked: if (root.ntfyService) root.ntfyService.reload()
+            }
+            Button {
+              text: "Unread"
+              selected: root.unreadOnly
+              tooltipText: "Toggle unread filter (u)"
+              onClicked: root.unreadOnly = !root.unreadOnly
             }
             Button {
               text: "Settings"
@@ -278,6 +305,7 @@ Panel {
           id: searchField
           width: parent.width
           visible: root.searchOpen
+          maximumLength: 256
           placeholderText: "Search label, topic, title, body, or tags"
           Keys.onEscapePressed: function(event) {
             if (text) text = ""
@@ -291,6 +319,7 @@ Panel {
           width: parent.width
           visible: root.ntfyService && root.ntfyService.lastError
           text: String(root.ntfyService ? root.ntfyService.lastError : "")
+          textFormat: Text.PlainText
           color: Color.urgent
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.caption
@@ -344,7 +373,7 @@ Panel {
                 model: root.tabState.tabs
                 delegate: Button {
                   required property var modelData
-                  text: String(modelData.label || "Server")
+                  text: Model.plainText(modelData.label || "Server", 64)
                     + (root.unreadFor(modelData.id) > 0 ? " " + root.unreadFor(modelData.id) : "")
                   selected: root.selectedServerId === modelData.id
                   onClicked: root.selectServer(modelData.id)
@@ -364,6 +393,7 @@ Panel {
               width: parent.width
               visible: root.servers.length === 0
               text: "Add a server to begin"
+              textFormat: Text.PlainText
               horizontalAlignment: Text.AlignHCenter
               color: Util.alpha(root.contentForeground, 0.72)
               font.family: root.contentFontFamily
@@ -380,7 +410,8 @@ Panel {
             Text {
               width: parent.width
               visible: root.servers.length > 0 && root.visibleRows.length === 0
-              text: root.searchQuery ? "No matches" : "Waiting for notifications"
+              text: (root.searchQuery || root.unreadOnly) ? "No matches" : "Waiting for notifications"
+              textFormat: Text.PlainText
               horizontalAlignment: Text.AlignHCenter
               color: Util.alpha(root.contentForeground, 0.72)
               font.family: root.contentFontFamily
@@ -438,6 +469,9 @@ Panel {
                 onMediaRequested: function(notificationKey, kind) {
                   if (root.ntfyService) root.ntfyService.fetchMedia(notificationKey, kind)
                 }
+                onOpenUrlRequested: function(url) {
+                  if (root.ntfyService) root.ntfyService.openUrl(url)
+                }
               }
             }
           }
@@ -452,13 +486,20 @@ Panel {
     parent: keyCatcher
     anchors.centerIn: parent
     modal: false
+    padding: Style.spacing.popupPadding
     closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+    background: BorderSurface {
+      color: Color.popups.background
+      borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+      radius: Style.cornerRadius
+    }
     contentItem: Column {
+      spacing: Style.space(4)
       Repeater {
         model: root.tabState.more
         delegate: Button {
           required property var modelData
-          text: String(modelData.label || "Server")
+          text: Model.plainText(modelData.label || "Server", 64)
             + (root.unreadFor(modelData.id) > 0 ? " " + root.unreadFor(modelData.id) : "")
           onClicked: root.selectServer(modelData.id)
         }
@@ -471,11 +512,18 @@ Panel {
     parent: keyCatcher
     anchors.centerIn: parent
     modal: true
+    padding: Style.spacing.popupPadding
     closePolicy: Popup.CloseOnEscape
+    background: BorderSurface {
+      color: Color.popups.background
+      borderSpec: Border.surfaceSpec("popups", "border", Color.popups.border, Math.max(1, Style.space(2)))
+      radius: Style.cornerRadius
+    }
     contentItem: Column {
       spacing: Style.space(8)
       Text {
         text: "Delete all notifications in current view?"
+        textFormat: Text.PlainText
         color: root.contentForeground
         font.family: root.contentFontFamily
         font.pixelSize: Style.font.body

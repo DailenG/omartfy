@@ -24,11 +24,13 @@ CursorSurface {
   signal deleteRequested(string notificationKey)
   signal actionRequested(string notificationKey, var action)
   signal mediaRequested(string notificationKey, string kind)
+  signal openUrlRequested(string url)
 
   readonly property var priority: Model.priorityMeta(notification.priority)
   readonly property var attachment: notification.attachment || ({})
   readonly property bool hasAttachment: !!attachment.url
   readonly property var notificationActions: notification.actions || []
+  readonly property var messageLinks: Model.extractLinks(notification.message)
   readonly property bool attachmentExpired: Number(attachment.expires || notification.expires || 0) > 0
     && Number(attachment.expires || notification.expires) <= Math.floor(Date.now() / 1000)
   readonly property var iconMediaState: service
@@ -39,7 +41,6 @@ CursorSurface {
   // card banner than squeezed into the icon slot; square avatars stay icons.
   readonly property bool cardView: iconImage.status === Image.Ready
     && iconImage.implicitWidth > iconImage.implicitHeight * 1.15
-
   function requestIcon() {
     if (root.visible && root.notification.icon && !root.notification.iconPath
         && root.iconMediaState.state === "idle")
@@ -117,6 +118,7 @@ CursorSurface {
           anchors.centerIn: parent
           visible: iconImage.status !== Image.Ready
           text: root.priority.glyph
+          textFormat: Text.PlainText
           color: root.priority.urgent ? Color.urgent
             : (root.notification.unread ? Color.accent : Util.alpha(root.foreground, 0.68))
           font.family: root.fontFamily
@@ -147,6 +149,7 @@ CursorSurface {
               - (root.notification.unread ? Style.space(11) : Style.space(5))
               - (rowActions.visible ? rowActions.implicitWidth + Style.space(6) : 0)
             text: String(root.notification.title || root.notification.message || "Notification")
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -195,6 +198,7 @@ CursorSurface {
           Text {
             id: timeLabel
             text: Model.relativeTime(root.notification.time, root.nowMs)
+            textFormat: Text.PlainText
             color: Util.alpha(root.foreground, 0.55)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -204,6 +208,7 @@ CursorSurface {
         Text {
           width: parent.width
           text: String(root.notification.message || "")
+          textFormat: Text.PlainText
           visible: text.length > 0
           color: Util.alpha(root.foreground, 0.78)
           font.family: root.fontFamily
@@ -216,6 +221,7 @@ CursorSurface {
           width: parent.width
           text: String(root.notification.topic || "")
             + (root.showServer ? " · " + String(root.notification.serverLabel || "") : "")
+          textFormat: Text.PlainText
           color: Util.alpha(root.foreground, 0.55)
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -233,20 +239,36 @@ CursorSurface {
       Text {
         width: parent.width
         visible: String(root.notification.message || "").length > 0
-        text: String(root.notification.message || "")
+        text: Model.shortenText(String(root.notification.message || ""))
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
-        maximumLineCount: 6
-        elide: Text.ElideRight
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
+      }
+
+      Flow {
+        width: parent.width
+        visible: root.messageLinks.length > 0
+        spacing: Style.space(7)
+
+        Repeater {
+          model: root.messageLinks
+          delegate: Button {
+            required property var modelData
+            text: Model.plainText(modelData.label, 64)
+            tooltipText: Model.plainText(modelData.url, 256)
+            fontSize: Style.font.caption
+            onClicked: root.openUrlRequested(modelData.url)
+          }
+        }
       }
 
       Text {
         width: parent.width
         visible: Array.isArray(root.notification.tags) && root.notification.tags.length > 0
         text: root.notification.tags.map(function(tag) { return "#" + tag }).join("  ")
+        textFormat: Text.PlainText
         color: Color.accent
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -270,6 +292,7 @@ CursorSurface {
           + (root.fileSize(root.attachment.size) ? " · " + root.fileSize(root.attachment.size) : "")
           + (root.attachmentExpired ? " · Expired"
              : (root.attachmentMediaState.state === "error" ? " · " + root.attachmentMediaState.text : ""))
+        textFormat: Text.PlainText
         color: Util.alpha(root.foreground, 0.68)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -309,6 +332,7 @@ CursorSurface {
             visible: parent.modelData.action === "http"
             text: parent.trusted ? Model.actionDisplay(parent.modelData)
               : "Publisher-supplied HTTP actions are disabled"
+            textFormat: Text.PlainText
             color: Util.alpha(root.foreground, 0.58)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -334,7 +358,7 @@ CursorSurface {
             : ({ state: "idle", text: "" })
 
           text: (actionState.state === "working" ? "Working"
-            : (actionState.state === "done" ? "Done" : String(modelData.label || "Action"))).toUpperCase()
+            : (actionState.state === "done" ? "Done" : Model.plainText(modelData.label || "Action", 64))).toUpperCase()
           enabled: root.actionsEnabled && actionState.state !== "working"
           onClicked: root.actionRequested(root.notification.notificationKey, modelData)
         }
@@ -351,6 +375,7 @@ CursorSurface {
         width: parent.width
         visible: actionState.state === "error"
         text: String(modelData.label || "Action") + " failed: " + actionState.text
+        textFormat: Text.PlainText
         color: Color.urgent
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

@@ -8,13 +8,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+
+sys.dont_write_bytecode = True
 import threading
 import time
 import unittest
 import unittest.mock
 import urllib.parse
 from pathlib import Path
-
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import ntfy_bridge as bridge_module
@@ -365,7 +367,6 @@ class BridgeCase(unittest.TestCase):
             # Cloudflare refuses Python's default User-Agent with error 1010.
             self.assertEqual(target.server.state.actions[-1]["headers"].get("User-Agent"), bridge_module.USER_AGENT)
             self.assertTrue(bridge_module.USER_AGENT.startswith("Omartfy/"))
-
     def test_media_allows_only_configured_origin_and_rejects_cross_origin_redirects(self):
         with RunningServer("media-token") as source, RunningServer() as target:
             server = normalize_server({"label": "Media", "baseUrl": source.url + "/proxy", "topics": ["alerts"],
@@ -721,10 +722,6 @@ class BridgeCase(unittest.TestCase):
                                             side_effect=OSError("no such host")):
                 self.assertFalse(bridge_module.resolves_to_public_addresses("invalid.invalid", 443))
 
-            # With the host policy out of the way, the server's token still never
-            # reaches another host: one that demands it gets no header and refuses.
-            # The pinned address is what gets connected to, not a fresh DNS answer:
-            # "media.invalid" never resolves, yet the fetch reaches the mock host.
             open_port = urllib.parse.urlsplit(open_host.url).port
             guarded_port = urllib.parse.urlsplit(guarded_host.url).port
             with unittest.mock.patch.object(bridge_module, "validate_media_url",
@@ -788,7 +785,6 @@ class BridgeCase(unittest.TestCase):
             bridge.enforce_media_cache = lambda: [path.unlink() for path in bridge.media_dir.iterdir()]
             bridge.send_native_toast(server, row)
             self.assertNotIn("--image", sent.pop())
-
     def test_save_delete_results_and_malformed_config_protection(self):
         bridge = self.make_bridge({"version": 1, "servers": []})
         candidate = {"label": "Offline", "baseUrl": "https://example.com", "topics": ["alerts"], "enabled": False}
@@ -831,6 +827,48 @@ class BridgeCase(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(any(event["event"] == "snapshot" and event["servers"] for event in events[1:]))
 
+
+    def test_open_url_validates_scheme_and_launches_browser(self):
+        bridge = self.make_bridge({"version": 1, "servers": []})
+        launched = []
+
+        def fake_popen(argv, **kwargs):
+            launched.append(list(argv))
+
+        with mock.patch.object(bridge_module.subprocess, "Popen", side_effect=fake_popen):
+            bridge.handle_command({"cmd": "open_url", "url": "https://example.com/path"})
+        self.assertEqual(launched, [["omarchy-launch-browser", "https://example.com/path"]])
+
+        for bad_url in (
+            "javascript:alert(1)",
+            "https://example.com/a --private b",
+            "https://example.com/a\nb",
+            "https://evil.example\\@trusted.com",
+        ):
+            bridge.handle_command({"cmd": "open_url", "url": bad_url})
+        self.assertEqual(len(launched), 1)
+        error = next(event for event in self.events() if event.get("event") == "error")
+        self.assertIn("Only HTTP and HTTPS", error["message"])
+
+    def test_symlink_protection_and_qml_plain_text_invariants(self):
+        victim = Path(self.temp.name) / "victim.json"
+        victim.write_text('{"version":1,"servers":[]}', encoding="utf-8")
+        link_config = Path(self.temp.name) / "symlink-config.json"
+        link_config.symlink_to(victim)
+        bridge = Bridge(link_config, Path(self.temp.name) / "symlink-state", io.StringIO())
+        self.bridges.append(bridge)
+        self.assertTrue(bridge.config_malformed)
+
+        repo_root = Path(__file__).resolve().parents[1]
+        for qml_file in sorted(repo_root.rglob("*.qml")):
+            source = qml_file.read_text(encoding="utf-8")
+            for match in bridge_module.re.finditer(r"\b(Text|Label|TextEdit|StyledText)\s*\{", source):
+                idx, depth = match.end(), 1
+                while idx < len(source) and depth:
+                    depth += (source[idx] == "{") - (source[idx] == "}")
+                    idx += 1
+                block = source[match.end():idx]
+                self.assertIn("textFormat: Text.PlainText", block, f"Missing PlainText in {qml_file.name}")
 
 if __name__ == "__main__":
     unittest.main()

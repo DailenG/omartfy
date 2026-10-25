@@ -21,6 +21,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+
+sys.dont_write_bytecode = True
 import threading
 import time
 import urllib.error
@@ -39,6 +41,18 @@ MAX_DISMISSED = 200
 MAX_MEDIA_FILE = 5 * 1024 * 1024
 MAX_MEDIA_CACHE = 50 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 4096
+MAX_LINE_BYTES = 65536
+MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_URL_LENGTH = 4096
+MAX_TITLE_LENGTH = 512
+MAX_MESSAGE_LENGTH = 16384
+MAX_TAGS = 32
+MAX_TAG_LENGTH = 64
+MAX_ACTION_BODY = 65536
+MAX_PENDING_TOASTS = 16
+URL_FORBIDDEN_RE = re.compile(r"[\x00-\x20\x7f-\x9f\\<>\"']")
+
+
 # ntfy sends a keepalive every 45 seconds by default, so a quiet stream is
 # only dead once it has been silent for well over that.
 def plugin_version() -> str:
@@ -102,24 +116,98 @@ def default_state_dir() -> Path:
     return root / "omarchy" / "ntfy"
 
 
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or not path.is_dir():
+        raise OSError(f"Refusing non-directory state path: {path}")
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
 def atomic_json_write(path: Path, value: Any, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ensure_private_dir(path.parent)
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
         os.replace(temporary, path)
-        os.chmod(path, mode)
+        fsync_directory(path.parent)
     finally:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
 
+
+def read_bounded_json(path: Path, max_bytes: int = MAX_FILE_BYTES) -> Any:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("Refusing non-regular file")
+        if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+            raise OSError("Refusing file owned by another user")
+        if st.st_size > max_bytes:
+            raise OSError("File exceeds size limit")
+        if hasattr(os, "set_blocking"):
+            os.set_blocking(fd, True)
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = os.read(fd, min(65536, max_bytes + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            chunks.append(chunk)
+        if total > max_bytes:
+            raise OSError("File grew past size limit")
+        return json.loads(b"".join(chunks).decode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def read_bounded_line(stream: Any, max_bytes: int = MAX_LINE_BYTES) -> bytes | None:
+    line = stream.readline(max_bytes + 1)
+    if isinstance(line, str):
+        raw = line.encode("utf-8", "replace")
+    else:
+        raw = bytes(line)
+    if not raw:
+        return None
+    if len(raw) > max_bytes:
+        while raw and not raw.endswith(b"\n"):
+            more = stream.readline(max_bytes)
+            if not more:
+                break
+            raw = more.encode("utf-8", "replace") if isinstance(more, str) else bytes(more)
+        raise ValueError("Line exceeds byte limit")
+    return raw
 
 def is_loopback_host(hostname: str | None) -> bool:
     host = (hostname or "").rstrip(".").lower()
@@ -135,6 +223,8 @@ def normalize_base_url(value: Any) -> str:
     url = str(value or "").strip()
     if url.endswith("/"):
         url = url[:-1]
+    if not url or len(url) > MAX_URL_LENGTH or URL_FORBIDDEN_RE.search(url):
+        raise ConfigError("Base URL must be an absolute HTTP or HTTPS URL")
     try:
         parsed = urllib.parse.urlsplit(url)
         _ = parsed.port
@@ -177,13 +267,15 @@ def normalize_server(candidate: dict[str, Any], existing: dict[str, Any] | None 
         raise ConfigError("Server id must be 12 lowercase hexadecimal characters")
 
     label = str(candidate.get("label") or "").strip()
-    if not label:
-        raise ConfigError("Label is required")
+    if not label or len(label) > 64 or any(ch in label for ch in "\r\n\0"):
+        raise ConfigError("Label is required and must be at most 64 characters")
     base_url = normalize_base_url(candidate.get("baseUrl"))
 
     raw_topics = candidate.get("topics")
     if not isinstance(raw_topics, list) or not raw_topics:
         raise ConfigError("At least one topic is required")
+    if len(raw_topics) > 64:
+        raise ConfigError("At most 64 topics are allowed per server")
     topics: list[str] = []
     seen_topics: set[str] = set()
     for raw_topic in raw_topics:
@@ -217,6 +309,10 @@ def normalize_server(candidate: dict[str, Any], existing: dict[str, Any] | None 
                 raise ConfigError("A new secret is required when changing authentication")
         if not secret:
             raise ConfigError("Authentication secret is required")
+        if len(username) > 256 or any(ch in username for ch in "\r\n\0"):
+            raise ConfigError("Invalid authentication username")
+        if len(secret) > 4096 or any(ch in secret for ch in "\r\n\0"):
+            raise ConfigError("Invalid authentication secret")
 
     allow_insecure = bool(candidate.get("allowInsecureHttp", False))
     parsed = urllib.parse.urlsplit(base_url)
@@ -322,8 +418,14 @@ def origin_tuple(url: str) -> tuple[str, str, int]:
 
 
 def validate_web_url(value: Any) -> str:
-    url = str(value or "")
-    parsed = urllib.parse.urlsplit(url)
+    url = str(value or "").strip()
+    if not url or len(url) > MAX_URL_LENGTH or URL_FORBIDDEN_RE.search(url):
+        raise ValueError("Only HTTP and HTTPS URLs are allowed")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        _ = parsed.port
+    except ValueError as error:
+        raise ValueError("URL has an invalid port") from error
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise ValueError("Only HTTP and HTTPS URLs are allowed")
     if parsed.username is not None or parsed.password is not None:
@@ -430,13 +532,14 @@ def clean_attachment(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
     result: dict[str, Any] = {}
-    for key in ("name", "url", "type"):
+    limits = {"name": 256, "url": MAX_URL_LENGTH, "type": 128}
+    for key, limit in limits.items():
         if key in raw:
-            result[key] = str(raw.get(key) or "")
+            result[key] = str(raw.get(key) or "")[:limit]
     for key in ("size", "expires"):
         if key in raw:
             try:
-                result[key] = int(raw.get(key) or 0)
+                result[key] = max(0, int(raw.get(key) or 0))
             except (TypeError, ValueError):
                 result[key] = 0
     return result
@@ -453,28 +556,33 @@ def normalize_actions(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, An
         action_type = str(candidate.get("action") or "")
         if action_type not in {"view", "http", "copy"}:
             continue
-        action_id = str(candidate.get("id") or f"action-{index + 1}")
-        method = str(candidate.get("method") or ("POST" if action_type == "http" else "")).upper()
+        action_id = str(candidate.get("id") or f"action-{index + 1}")[:64]
+        method = str(candidate.get("method") or ("POST" if action_type == "http" else "")).upper()[:16]
         item = {
             "id": action_id,
             "action": action_type,
-            "label": str(candidate.get("label") or action_type.title()),
+            "label": str(candidate.get("label") or action_type.title())[:128],
             "clear": bool(candidate.get("clear", False)),
-            "url": str(candidate.get("url") or ""),
+            "url": str(candidate.get("url") or "")[:MAX_URL_LENGTH],
             "method": method,
         }
         public.append(dict(item))
         private = dict(item)
         if action_type == "copy":
-            private["value"] = str(candidate.get("value") or "")
+            private["value"] = str(candidate.get("value") or "")[:MAX_ACTION_BODY]
         if action_type == "http":
             headers = candidate.get("headers")
-            private["headers"] = dict(headers) if isinstance(headers, dict) else {}
+            if isinstance(headers, dict):
+                private["headers"] = {
+                    str(k)[:128]: str(v)[:4096]
+                    for k, v in list(headers.items())[:32]
+                }
+            else:
+                private["headers"] = {}
             body = candidate.get("body")
-            private["body"] = "" if body is None else str(body)
+            private["body"] = "" if body is None else str(body)[:MAX_ACTION_BODY]
         protected.append(private)
     return public, protected
-
 
 def qml_notification(row: dict[str, Any]) -> dict[str, Any]:
     actions = row.get("actions") if isinstance(row.get("actions"), list) else []
@@ -603,7 +711,11 @@ class SubscriptionWorker(threading.Thread):
 
     def _consume(self, response: Any, advance_cursor: bool, show_toast: bool) -> None:
         while not self.stop_event.is_set() and not self.bridge.stop_event.is_set():
-            line = response.readline()
+            try:
+                line = read_bounded_line(response, MAX_LINE_BYTES)
+            except ValueError:
+                self.bridge.emit({"event": "error", "fatal": False, "message": "Ignored malformed ntfy stream data"})
+                continue
             if not line:
                 break
             try:
@@ -748,6 +860,7 @@ class Bridge:
         # One worker keeps toasts in arrival order while their image downloads
         # stay off the subscription streams.
         self.toast_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ntfy-toast")
+        self.pending_toasts = 0
         self.request_pacer = RequestPacer()
         self.workers: dict[str, SubscriptionWorker] = {}
         self.statuses: dict[str, dict[str, str]] = {}
@@ -759,17 +872,17 @@ class Bridge:
         self.state = self.load_state()
 
     def load_config(self) -> dict[str, Any]:
-        if not self.config_path.exists():
+        try:
+            raw = read_bounded_json(self.config_path)
+            return validate_config(raw)
+        except FileNotFoundError:
             return {
                 "version": 1,
                 "toasts": {"enabled": False, "duration": "default"},
                 "batchAction": "delete_all",
                 "servers": [],
             }
-        try:
-            with self.config_path.open("r", encoding="utf-8") as handle:
-                return validate_config(json.load(handle))
-        except (OSError, json.JSONDecodeError, ConfigError) as error:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ConfigError) as error:
             self.config_malformed = True
             self.config_error = bounded_text(error)
             return {
@@ -778,23 +891,20 @@ class Bridge:
                 "batchAction": "delete_all",
                 "servers": [],
             }
+
     def load_state(self) -> dict[str, Any]:
         empty = {"version": 1, "muteUntil": 0, "servers": {}}
-        if not self.state_path.exists():
-            return empty
         try:
-            with self.state_path.open("r", encoding="utf-8") as handle:
-                raw = json.load(handle)
+            raw = read_bounded_json(self.state_path)
             if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("servers"), dict):
                 raise ValueError("Unsupported state format")
             mute_until = raw.get("muteUntil", 0)
-            if not isinstance(mute_until, (int, float)):
+            if not isinstance(mute_until, (int, float)) or not math.isfinite(mute_until):
                 mute_until = 0
             raw["muteUntil"] = int(mute_until)
             return raw
-        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
             return empty
-
     def server_by_id(self, server_id: str) -> dict[str, Any] | None:
         return next((server for server in self.config["servers"] if server["id"] == server_id), None)
 
@@ -872,6 +982,8 @@ class Bridge:
         return str(getattr(error, "strerror", "") or error or type(error).__name__)[:160]
 
     def toast_image(self, server: dict[str, Any], row: dict[str, Any]) -> str:
+        if self.stop_event.is_set():
+            return ""
         attachment = row.get("attachment") or {}
         url = str(attachment.get("url") or "")
         content_type = str(attachment.get("type") or "")
@@ -888,6 +1000,14 @@ class Bridge:
         # Eviction removes unreferenced files first, which can include this one.
         return str(path) if path.exists() else ""
 
+    def _send_native_toast_job(self, server: dict[str, Any], row: dict[str, Any]) -> None:
+        try:
+            if not self.stop_event.is_set():
+                self.send_native_toast(server, row)
+        finally:
+            with self.toast_lock:
+                self.pending_toasts = max(0, self.pending_toasts - 1)
+
     def send_native_toast(self, server: dict[str, Any], row: dict[str, Any]) -> None:
         with self.state_lock:
             current_server = self.server_by_id(str(server.get("id") or ""))
@@ -899,11 +1019,11 @@ class Bridge:
             return
 
         summary_source = " ".join(
-            str(row.get("title") or "Omartfy").replace("\0", "�").splitlines()
+            str(row.get("title") or "Omartfy").replace("\0", "").splitlines()
         ).strip()[:160]
-        label = " ".join(str(current_server["label"]).replace("\0", "�").splitlines()).strip()
-        topic = str(row.get("topic") or "").replace("\0", "�")
-        message = str(row.get("message") or "").replace("\0", "�")
+        label = " ".join(str(current_server["label"]).replace("\0", "").splitlines()).strip()
+        topic = str(row.get("topic") or "").replace("\0", "")
+        message = str(row.get("message") or "").replace("\0", "")
         body_source = f"{label} · {topic}\n{message}"[:500]
         if summary_source.startswith("-"):
             summary_source = " " + summary_source
@@ -952,7 +1072,6 @@ class Bridge:
         else:
             with self.toast_lock:
                 self.toast_error_active = False
-
     def set_server_status(self, server_id: str, state: str, error: str = "") -> None:
         safe = self.safe_error(error, "") if error else ""
         with self.state_lock:
@@ -996,11 +1115,11 @@ class Bridge:
         server = self.server_by_id(server_id)
         if server is None:
             raise ValueError("Unknown server")
-        message_id = str(event.get("id") or "")
+        message_id = str(event.get("id") or "")[:128]
         topic = str(event.get("topic") or "")
         if not message_id or not TOPIC_RE.fullmatch(topic):
             raise ValueError("Message is missing an id or valid topic")
-        effective_sequence = str(event.get("sequence_id") or message_id)
+        effective_sequence = str(event.get("sequence_id") or message_id)[:128]
         actions, protected_actions = normalize_actions(event.get("actions"))
         tags = event.get("tags") if isinstance(event.get("tags"), list) else []
         priority = event.get("priority", 3)
@@ -1015,7 +1134,7 @@ class Bridge:
         except (TypeError, ValueError):
             event_time = int(time.time())
         try:
-            expires = int(event.get("expires") or 0)
+            expires = max(0, int(event.get("expires") or 0))
         except (TypeError, ValueError):
             expires = 0
         row = {
@@ -1027,16 +1146,16 @@ class Bridge:
             "time": event_time,
             "expires": expires,
             "topic": topic,
-            "message": str(event.get("message") or ""),
-            "title": str(event.get("title") or f"{server['label']}/{topic}"),
-            "tags": [str(tag) for tag in tags],
+            "message": str(event.get("message") or "")[:MAX_MESSAGE_LENGTH],
+            "title": str(event.get("title") or f"{server['label']}/{topic}")[:MAX_TITLE_LENGTH],
+            "tags": [str(tag)[:MAX_TAG_LENGTH] for tag in tags[:MAX_TAGS] if str(tag)],
             "priority": priority,
             "unread": True,
-            "click": str(event.get("click") or ""),
+            "click": str(event.get("click") or "")[:MAX_URL_LENGTH],
             "actions": actions,
             "attachment": clean_attachment(event.get("attachment")),
-            "icon": str(event.get("icon") or ""),
-            "contentType": str(event.get("content_type") or ""),
+            "icon": str(event.get("icon") or "")[:MAX_URL_LENGTH],
+            "contentType": str(event.get("content_type") or "")[:128],
             "iconPath": "",
             "attachmentPath": "",
             "_actions": protected_actions,
@@ -1099,9 +1218,15 @@ class Bridge:
             self.persist_state()
         if emitted:
             self.emit(emitted)
-        if native_toast:
-            self.toast_executor.submit(self.send_native_toast, *native_toast)
-
+        if native_toast and not self.stop_event.is_set():
+            with self.toast_lock:
+                if self.pending_toasts < MAX_PENDING_TOASTS:
+                    self.pending_toasts += 1
+                    should_submit = True
+                else:
+                    should_submit = False
+            if should_submit:
+                self.toast_executor.submit(self._send_native_toast_job, *native_toast)
     def mark_read(self, server_id: str) -> None:
         changed: list[dict[str, Any]] = []
         with self.state_lock:
@@ -1204,13 +1329,14 @@ class Bridge:
     def remove_media_for_rows(self, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             for field in ("iconPath", "attachmentPath"):
-                path = str(row.get(field) or "")
-                if path:
+                path_str = str(row.get(field) or "")
+                if path_str:
+                    candidate = Path(path_str)
                     try:
-                        Path(path).unlink()
-                    except FileNotFoundError:
+                        if not candidate.is_symlink() and candidate.resolve().is_relative_to(self.media_dir.resolve()):
+                            candidate.unlink()
+                    except (FileNotFoundError, OSError):
                         pass
-
     def save_server(self, request_id: str, candidate: Any) -> None:
         if self.config_malformed:
             self.emit({"event": "config_result", "requestId": request_id, "operation": "save",
@@ -1509,10 +1635,18 @@ class Bridge:
             auth = authorization_header(server)
             if auth:
                 request.add_header("Authorization", auth)
+            deadline = time.monotonic() + 10.0
             with self.urlopen(request, timeout=10) as response:
                 status = int(getattr(response, "status", 200))
                 saw_json = False
-                for line in response:
+                lines_read = 0
+                while lines_read < 256:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Connection test timed out")
+                    line = read_bounded_line(response, MAX_LINE_BYTES)
+                    if line is None:
+                        break
+                    lines_read += 1
                     if not line.strip():
                         continue
                     value = json.loads(line.decode("utf-8"))
@@ -1624,18 +1758,18 @@ class Bridge:
             raise MediaError("Unsupported image format")
         if not width or not height or width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
             raise MediaError("Image dimensions exceed 4096×4096")
-        self.media_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        ensure_private_dir(self.media_dir)
         digest = hashlib.sha256(f"{server['id']}\0{kind}\0{source_url}".encode("utf-8")).hexdigest()
         destination = self.media_dir / f"{digest}.{image_type}"
         fd, temporary = tempfile.mkstemp(prefix=".media.", dir=self.media_dir)
         try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
             os.replace(temporary, destination)
-            os.chmod(destination, 0o600)
+            fsync_directory(self.media_dir)
         finally:
             try:
                 os.unlink(temporary)
@@ -1645,7 +1779,7 @@ class Bridge:
         return destination.resolve()
 
     def enforce_media_cache(self) -> None:
-        if not self.media_dir.exists():
+        if not self.media_dir.exists() or self.media_dir.is_symlink():
             return
         with self.state_lock:
             references: dict[Path, tuple[dict[str, Any], str]] = {}
@@ -1655,7 +1789,18 @@ class Bridge:
                         value = str(row.get(field) or "")
                         if value:
                             references[Path(value)] = (row, field)
-            files = [path for path in self.media_dir.iterdir() if path.is_file() and not path.name.startswith(".")]
+            files: list[Path] = []
+            for path in self.media_dir.iterdir():
+                if path.name.startswith("."):
+                    continue
+                if path.is_symlink():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                if path.is_file():
+                    files.append(path)
             files.sort(key=lambda path: path.stat().st_mtime)
             total = sum(path.stat().st_size for path in files)
             for referenced in (False, True):
@@ -1676,7 +1821,6 @@ class Bridge:
                         row, field = references[path.resolve()]
                         row[field] = ""
             self.persist_state()
-
     def reload(self) -> None:
         for server_id in list(self.workers):
             self.stop_worker(server_id)
@@ -1721,8 +1865,27 @@ class Bridge:
             self.delete_server(request_id, str(command.get("serverId") or ""))
         elif name == "test_server":
             self.test_server(request_id, command.get("server"))
+        elif name == "open_url":
+            try:
+                url = validate_web_url(command.get("url"))
+            except ValueError as error:
+                self.emit({"event": "error", "fatal": False, "message": str(error)})
+            else:
+                subprocess.Popen(["omarchy-launch-browser", url], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif name == "copy_text":
+            text = str(command.get("text") or "")[:MAX_ACTION_BODY]
+            if text:
+                self.executor.submit(self._copy_text_task, text)
         else:
             self.emit({"event": "error", "fatal": False, "message": "Unknown bridge command"})
+
+    def _copy_text_task(self, text: str) -> None:
+        try:
+            subprocess.run(["wl-copy"], input=text.encode("utf-8"),
+                           check=True, timeout=15, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.emit({"event": "error", "fatal": False, "message": self.safe_error(error, "Could not copy text")})
 
     def shutdown(self) -> None:
         self.stop_event.set()
@@ -1736,13 +1899,20 @@ class Bridge:
         self.emit(self.snapshot())
         self.start_all()
         try:
-            for line in sys.stdin:
+            while True:
                 try:
-                    command = json.loads(line)
+                    raw_line = read_bounded_line(sys.stdin, MAX_LINE_BYTES)
+                except ValueError:
+                    self.emit({"event": "error", "fatal": False, "message": "Ignored malformed bridge command"})
+                    continue
+                if raw_line is None:
+                    break
+                try:
+                    command = json.loads(raw_line.decode("utf-8"))
                     if not isinstance(command, dict):
                         raise ValueError
                     self.handle_command(command)
-                except (json.JSONDecodeError, ValueError):
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     self.emit({"event": "error", "fatal": False, "message": "Ignored malformed bridge command"})
         finally:
             self.shutdown()

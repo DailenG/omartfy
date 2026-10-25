@@ -115,6 +115,8 @@ Clicking a notification that has a click URL opens it and marks it read, as tapp
 | `1`–`3` | Run the corresponding visible ntfy action |
 | `o` | Open the notification click URL |
 | `a` | Open the attachment URL |
+| `c` / `y` | Copy selected notification message |
+| `u` | Toggle unread-only filter |
 | `d`, `x`, or Delete | Delete locally |
 | `r` | Reconnect and reload |
 | `s` | Open server settings |
@@ -124,7 +126,7 @@ Clicking a notification that has a click URL opens it and marks it read, as tapp
 
 ## Do Not Disturb
 
-Right-click the Omartfy bar icon and choose **1 hour**, **4 hours**, **Until tomorrow**, or **Until turned off**. DND continues collecting notifications while suppressing the unread badge and urgent icon color. The setting survives shell restarts; use **Turn off DND** from the same menu to resume normal presentation.
+Right-click the Omartfy bar icon and choose **1 hour**, **4 hours**, **8 hours**, **Until tomorrow**, or **Until turned off**. DND continues collecting notifications while suppressing the unread badge and urgent icon color. The setting survives shell restarts; use **Turn DND off** from the same menu to resume normal presentation.
 
 ## Data and security
 

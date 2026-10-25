@@ -9,6 +9,15 @@ function parseLine(line) {
   }
 }
 
+function plainText(value, maxLength) {
+  var limit = Number(maxLength) || 256
+  var text = String(value || "")
+    .replace(/[<>&\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return text.length > limit ? text.slice(0, limit - 1) + "\u2026" : text
+}
+
 function parseBaseUrl(value) {
   var text = String(value || "").trim()
   var scheme = /^(https?):\/\//i.exec(text)
@@ -66,12 +75,14 @@ function relativeTime(epochSeconds, nowMs) {
   return (date.getMonth() + 1) + "/" + date.getDate()
 }
 
-function filterRows(rows, serverId, query) {
+function filterRows(rows, serverId, query, unreadOnly) {
   var source = Array.isArray(rows) ? rows : []
   var selected = String(serverId || "all")
   var needle = String(query || "").trim().toLowerCase()
+  var onlyUnread = unreadOnly === true
   var result = source.filter(function(row) {
     if (!row || typeof row !== "object") return false
+    if (onlyUnread && !row.unread) return false
     if (selected !== "all" && String(row.serverId || "") !== selected) return false
     if (!needle) return true
     var tags = Array.isArray(row.tags) ? row.tags.join(" ") : ""
@@ -131,4 +142,45 @@ function actionDisplay(action) {
   if (type === "copy") return "Copy"
   if (type === "view") return "Open"
   return ""
+}
+
+function extractLinks(text) {
+  var source = String(text || "")
+  var matches = source.match(/https?:\/\/[^\s<>"'`\\\u0000-\u0020\u007f-\u009f\u2026]+/g) || []
+  var seen = Object.create(null)
+  var links = []
+  for (var index = 0; index < matches.length && links.length < 12; index++) {
+    var raw = matches[index].replace(/[.,;:!?]+$/, "")
+    if (!raw || raw.length > 4096 || seen[raw]) continue
+    seen[raw] = true
+    links.push({ url: raw, label: shortenUrl(raw) })
+  }
+  return links
+}
+
+function shortenUrl(url, maxLength) {
+  var limit = Number(maxLength) || 48
+  var text = String(url || "")
+  var match = /^https?:\/\/([^\/?#]+)([^#]*)/i.exec(text)
+  if (!match) {
+    return text.length > limit ? text.slice(0, limit - 1) + "\u2026" : text
+  }
+  var host = match[1]
+  var path = match[2] || ""
+  if (path === "/") path = ""
+  var label = host + path
+  if (label.length > limit) {
+    var keep = limit - host.length - 1
+    label = keep > 0 ? host + path.slice(0, keep) : host
+    label += "\u2026"
+  }
+  return label
+}
+
+function shortenText(text) {
+  return String(text || "").replace(/https?:\/\/[^\s<>"'`\\\u0000-\u0020\u007f-\u009f\u2026]+/g, function(raw) {
+    var stripped = raw.replace(/[.,;:!?]+$/, "")
+    if (!stripped) return raw
+    return shortenUrl(stripped) + raw.slice(stripped.length)
+  })
 }
