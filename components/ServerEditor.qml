@@ -131,6 +131,7 @@ Item {
       enabled: enabledCheck.checked,
       showToasts: showToastsCheck.checked,
       allowHttpActions: httpActionsCheck.checked,
+      allowExternalMedia: externalMediaCheck.checked,
       allowInsecureHttp: insecureCheck.checked,
       auth: {
         type: root.authType(),
@@ -149,6 +150,7 @@ Item {
     enabledCheck.checked = true
     showToastsCheck.checked = true
     httpActionsCheck.checked = false
+    externalMediaCheck.checked = false
     insecureCheck.checked = false
     authTypeBox.currentIndex = 0
     usernameField.text = ""
@@ -171,6 +173,7 @@ Item {
     enabledCheck.checked = server.enabled !== false
     showToastsCheck.checked = server.showToasts !== false
     httpActionsCheck.checked = server.allowHttpActions === true
+    externalMediaCheck.checked = server.allowExternalMedia === true
     insecureCheck.checked = server.allowInsecureHttp === true
     var type = String((server.auth || {}).type || "none")
     authTypeBox.currentIndex = Math.max(0, ["none", "token", "basic"].indexOf(type))
@@ -487,6 +490,12 @@ Item {
           spacing: Style.space(12)
           CheckBox { id: enabledCheck; text: "Enabled"; checked: true }
           CheckBox { id: httpActionsCheck; text: "Allow publisher-supplied HTTP actions" }
+        }
+
+        CheckBox {
+          id: externalMediaCheck
+          width: parent.width
+          text: "Load images from other hosts"
         }
 
         CheckBox {

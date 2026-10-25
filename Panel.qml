@@ -84,6 +84,17 @@ Panel {
     }
   }
 
+  // Like tapping a phone notification: a row with a link opens it and counts
+  // as read; a row without one expands in place.
+  function activateSelected() {
+    var row = root.selectedRow()
+    if (!row) return
+    if (row.click && root.ntfyService && root.ntfyService.helperReady) {
+      root.openSpecial("__click")
+      root.markSelectedRead()
+    } else root.toggleSelected()
+  }
+
   function toggleSelected() {
     var row = root.selectedRow()
     if (!row) return
@@ -408,6 +419,10 @@ Panel {
                 nowMs: root.nowMs
                 onHovered: function(rowIndex) { root.selectedIndex = rowIndex }
                 onActivated: function(rowIndex) {
+                  root.selectedIndex = rowIndex
+                  root.activateSelected()
+                }
+                onExpandRequested: function(rowIndex) {
                   root.selectedIndex = rowIndex
                   root.toggleSelected()
                 }

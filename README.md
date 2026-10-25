@@ -71,6 +71,7 @@ Each profile has its own connection and trust boundary:
 - **Topics:** one or more comma-separated ntfy topic names
 - **Authentication:** none, Bearer token, or Basic username/password
 - **Allow publisher-supplied HTTP actions:** disabled by default; enable only for trusted publishers
+- **Load images from other hosts:** disabled by default; lets icons and image attachments load from hosts other than the server, such as YouTube thumbnails from an RSS bridge. Those hosts see your IP address and when the image loads
 - **Show toasts from this server:** enabled per profile by default; the global desktop-notification switch remains the master control
 - **Allow credentials over insecure HTTP:** shown only when credentials would cross non-loopback plain HTTP
 
@@ -102,6 +103,8 @@ o.bind("SUPER + N", "Omartfy notifications", "omarchy-shell shell toggle dailen.
 ```
 
 The panel focuses its first notification when opened from the shortcut.
+
+Clicking a notification that has a click URL opens it and marks it read, as tapping one does on a phone. Use the ⌄ button beside ✓ and × (or `e`) to expand it instead. Notifications without a click URL expand when clicked.
 
 | Key | Action |
 | --- | --- |
@@ -136,7 +139,7 @@ Omarchy plugins run unsandboxed with the current user's permissions. Omartfy:
 - Keeps HTTP actions disabled per server until explicitly enabled
 - Runs publisher-provided HTTP actions only after user activation, without redirects or retries
 - Launches validated HTTP(S) view URLs through `omarchy-launch-browser` and copies values through `wl-copy`
-- Fetches notification icons and attachment previews only from the configured server's exact scheme, host, and effective port; every automatic-media redirect must retain that origin
+- Fetches notification icons and attachment previews only from the configured server's exact scheme, host, and effective port, unless **Load images from other hosts** is enabled for that server, in which case other hosts must use HTTPS and resolve only to public addresses; every automatic-media redirect is checked under the same per-server policy
 - Keeps explicit, user-activated opening of validated HTTP(S) view and attachment URLs separate from automatic media fetching
 
 Review topic access controls and publisher trust before enabling a server or HTTP actions. See [SECURITY.md](SECURITY.md) for the reporting policy and implementation boundaries.

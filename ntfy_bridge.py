@@ -6,12 +6,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
+import math
 import os
 import random
 import re
 import secrets
+import socket
+import ssl
 import stat
 import struct
 import subprocess
@@ -35,8 +39,33 @@ MAX_DISMISSED = 200
 MAX_MEDIA_FILE = 5 * 1024 * 1024
 MAX_MEDIA_CACHE = 50 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 4096
-STREAM_TIMEOUT_SECONDS = 10
-POLL_INTERVAL_SECONDS = 10
+# ntfy sends a keepalive every 45 seconds by default, so a quiet stream is
+# only dead once it has been silent for well over that.
+def plugin_version() -> str:
+    try:
+        manifest = json.loads((Path(__file__).resolve().parent / "manifest.json").read_text(encoding="utf-8"))
+        return str(manifest.get("version") or "dev")
+    except (OSError, ValueError, AttributeError):
+        return "dev"
+
+
+# Sent on every request. Python's default "Python-urllib/3.x" is refused by
+# common bot filters (Cloudflare answers it with error 1010) before the
+# request reaches the ntfy server or an HTTP action's target.
+USER_AGENT = f"Omartfy/{plugin_version()} (+https://github.com/DailenG/omartfy)"
+STREAM_TIMEOUT_SECONDS = 90
+POLL_INTERVAL_SECONDS = 60
+# A server that fell back to polling retries streaming after this many polls.
+POLLS_BEFORE_STREAM_RETRY = 10
+# Subscription requests share one budget per server origin, well under
+# ntfy.sh's default visitor limit (a burst of 60, then one every 5 seconds),
+# however many profiles point at that origin.
+REQUEST_BURST = 20
+REQUEST_REFILL_SECONDS = 10.0
+RETRY_DELAYS = [2, 4, 8, 16, 32, 60, 120, 300]
+RATE_LIMIT_MIN_DELAY = 60.0
+MAX_RETRY_DELAY = 600.0
+MAX_RETRY_AFTER = 86400.0
 HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
 FORBIDDEN_ACTION_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
 BATCH_ACTIONS = {"delete_all", "read_all"}
@@ -206,6 +235,7 @@ def normalize_server(candidate: dict[str, Any], existing: dict[str, Any] | None 
         "enabled": bool(candidate.get("enabled", True)),
         "showToasts": show_toasts,
         "allowHttpActions": bool(candidate.get("allowHttpActions", False)),
+        "allowExternalMedia": bool(candidate.get("allowExternalMedia", False)),
         "allowInsecureHttp": allow_insecure,
         "auth": {"type": auth_type, "username": username, "secret": secret},
     }
@@ -246,6 +276,7 @@ def public_server(server: dict[str, Any], state: str = "disabled", error: str = 
         "topics": list(server["topics"]),
         "enabled": bool(server["enabled"]),
         "allowHttpActions": bool(server["allowHttpActions"]),
+        "allowExternalMedia": bool(server.get("allowExternalMedia", False)),
         "showToasts": bool(server["showToasts"]),
         "allowInsecureHttp": bool(server["allowInsecureHttp"]),
         "auth": {
@@ -300,10 +331,98 @@ def validate_web_url(value: Any) -> str:
     return url
 
 
+def resolve_public_address(hostname: str, port: int, timeout: float) -> str:
+    """Resolve within the timeout and return an address to pin, if every result is public."""
+    outcome: dict[str, Any] = {}
+
+    def lookup() -> None:
+        try:
+            outcome["infos"] = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError) as error:
+            outcome["error"] = error
+
+    # getaddrinfo takes no timeout, so the lookup runs on a daemon thread that
+    # is abandoned if the system resolver outlasts the deadline.
+    resolver = threading.Thread(target=lookup, name="ntfy-resolve", daemon=True)
+    resolver.start()
+    resolver.join(max(0.0, timeout))
+    if resolver.is_alive():
+        raise MediaError("External media lookup timed out")
+    addresses = [info[4][0].split("%", 1)[0] for info in outcome.get("infos") or []]
+    parsed = {ipaddress.ip_address(address) for address in addresses}
+    if not parsed or not all(address.is_global and not address.is_multicast for address in parsed):
+        raise MediaError("External media must resolve to public addresses")
+    return addresses[0]
+
+
+def resolves_to_public_addresses(hostname: str, port: int, timeout: float = 8.0) -> bool:
+    try:
+        resolve_public_address(hostname, port, timeout)
+    except MediaError:
+        return False
+    return True
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connects to an address checked in advance, never a fresh DNS answer."""
+
+    def __init__(self, host: str, address: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self.pinned_address = address
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self.pinned_address, self.port), self.timeout, self.source_address)
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """TLS to a pre-checked address, verifying the certificate for the hostname."""
+
+    def __init__(self, host: str, address: str, **kwargs: Any) -> None:
+        self.pinned_context = ssl.create_default_context()
+        super().__init__(host, context=self.pinned_context, **kwargs)
+        self.pinned_address = address
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.pinned_address, self.port), self.timeout, self.source_address)
+        self.sock = self.pinned_context.wrap_socket(sock, server_hostname=self.host)
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, address: str) -> None:
+        super().__init__()
+        self.pinned_address = address
+
+    def http_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(lambda host, **kwargs: PinnedHTTPConnection(host, self.pinned_address, **kwargs), req)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, address: str) -> None:
+        super().__init__()
+        self.pinned_address = address
+
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(lambda host, **kwargs: PinnedHTTPSConnection(host, self.pinned_address, **kwargs), req)
+
+
+def pinned_media_opener(address: str) -> urllib.request.OpenerDirector:
+    # An empty ProxyHandler keeps ambient proxy settings from carrying the
+    # request somewhere other than the pinned address.
+    return urllib.request.build_opener(NoRedirect, urllib.request.ProxyHandler({}),
+                                       PinnedHTTPHandler(address), PinnedHTTPSHandler(address))
+
+
 def validate_media_url(server: dict[str, Any], value: Any) -> str:
     url = validate_web_url(value)
-    if origin_tuple(url) != origin_tuple(server["baseUrl"]):
+    if origin_tuple(url) == origin_tuple(server["baseUrl"]):
+        return url
+    if not server.get("allowExternalMedia", False):
         raise MediaError("Media URL must use the configured server origin")
+    # The external-media opt-in covers other public hosts, never the local
+    # network, and never plaintext. Redirects come back through here too;
+    # download_media resolves and pins a public address for each hop.
+    if origin_tuple(url)[0] != "https":
+        raise MediaError("External media must use HTTPS")
     return url
 
 
@@ -417,6 +536,27 @@ def image_info(data: bytes) -> tuple[str, int, int]:
     raise MediaError("Unsupported image format")
 
 
+class RequestPacer:
+    """Token bucket per server origin, shared by every profile on that origin."""
+
+    def __init__(self, burst: int = REQUEST_BURST, refill_seconds: float = REQUEST_REFILL_SECONDS,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.burst = float(burst)
+        self.refill_seconds = float(refill_seconds)
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.buckets: dict[tuple[str, str, int], tuple[float, float]] = {}
+
+    def reserve(self, origin: tuple[str, str, int]) -> float:
+        """Take one request slot and return how long to wait before using it."""
+        with self.lock:
+            now = self.clock()
+            tokens, last = self.buckets.get(origin, (self.burst, now))
+            tokens = min(self.burst, tokens + (now - last) / self.refill_seconds) - 1.0
+            self.buckets[origin] = (tokens, now)
+            return 0.0 if tokens >= 0 else -tokens * self.refill_seconds
+
+
 class SubscriptionWorker(threading.Thread):
     def __init__(self, bridge: "Bridge", server: dict[str, Any],
                  bootstrap_topics: list[str] | None = None,
@@ -437,13 +577,25 @@ class SubscriptionWorker(threading.Thread):
         with self.response_lock:
             response = self.response
         if response is not None:
+            # close() waits for the worker's in-flight readline, which can sit for
+            # the whole stream timeout; shutting the socket down wakes it now.
+            sock = getattr(getattr(getattr(response, "fp", None), "raw", None), "_sock", None)
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
             try:
                 response.close()
             except Exception:
                 pass
 
     def _open(self, topics: list[str], since: str, poll: bool) -> Any:
-        request = urllib.request.Request(stream_url(self.server, topics, since, poll), method="GET")
+        wait = self.bridge.request_pacer.reserve(origin_tuple(self.server["baseUrl"]))
+        if wait and (self.stop_event.wait(wait) or self.bridge.stop_event.is_set()):
+            raise InterruptedError("Subscription stopped")
+        request = urllib.request.Request(stream_url(self.server, topics, since, poll), method="GET",
+                                         headers={"User-Agent": USER_AGENT})
         authorization = authorization_header(self.server)
         if authorization:
             request.add_header("Authorization", authorization)
@@ -483,13 +635,17 @@ class SubscriptionWorker(threading.Thread):
                     return
                 self.bridge.emit({"event": "error", "fatal": False,
                                   "message": f"Could not load topics: HTTP {error.code}"})
+            except InterruptedError:
+                return
             except Exception as error:
                 self.bridge.emit({"event": "error", "fatal": False,
                                   "message": self.bridge.safe_error(error, "Could not load topics")})
 
-        delays = [1, 2, 4, 8, 16]
         attempt = 0
+        rate_limited = 0
         poll_mode = False
+        polls = 0
+        retry_after = 0.0
         while not self.stop_event.is_set() and not self.bridge.stop_event.is_set():
             if not poll_mode:
                 self.bridge.set_server_status(server_id, "connecting", "")
@@ -503,6 +659,7 @@ class SubscriptionWorker(threading.Thread):
                 with self.response_lock:
                     self.response = response
                 attempt = 0
+                rate_limited = 0
                 self.bridge.set_server_status(server_id, "connected", "")
                 try:
                     self._consume(response, advance_cursor=True, show_toast=True)
@@ -513,6 +670,9 @@ class SubscriptionWorker(threading.Thread):
                 if self.stop_event.is_set() or self.bridge.stop_event.is_set():
                     return
                 if poll_mode:
+                    polls += 1
+                    if polls >= POLLS_BEFORE_STREAM_RETRY:
+                        poll_mode, polls = False, 0
                     self.stop_event.wait(POLL_INTERVAL_SECONDS)
                     continue
                 raise EOFError("ntfy stream closed")
@@ -524,15 +684,21 @@ class SubscriptionWorker(threading.Thread):
                     self.bridge.set_server_status(server_id, "auth-error", "Authentication failed")
                     return
                 if error.code == 429:
+                    # Hammering a rate limit gets the address blocked outright, so
+                    # back off hard and keep doubling while it persists.
                     try:
-                        delay = min(60.0, max(0.0, float(error.headers.get("Retry-After", "1"))))
+                        retry_after = float(error.headers.get("Retry-After") or 0)
                     except (TypeError, ValueError):
-                        delay = 1.0
-                elif 500 <= error.code <= 599:
-                    delay = delays[min(attempt, len(delays) - 1)] if attempt < len(delays) else 30
-                    attempt += 1
+                        retry_after = 0.0
+                    # inf, NaN or an absurd value would overflow the wait below
+                    # and kill this worker; a day is the longest honoured.
+                    if not math.isfinite(retry_after) or retry_after < 0:
+                        retry_after = 0.0
+                    retry_after = min(retry_after, MAX_RETRY_AFTER)
+                    delay = max(retry_after, RATE_LIMIT_MIN_DELAY * 2 ** min(rate_limited, 4))
+                    rate_limited += 1
                 else:
-                    delay = delays[min(attempt, len(delays) - 1)] if attempt < len(delays) else 30
+                    delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                     attempt += 1
                 message = f"HTTP {error.code}"
             except TimeoutError as error:
@@ -541,9 +707,9 @@ class SubscriptionWorker(threading.Thread):
                 if self.stop_event.is_set() or self.bridge.stop_event.is_set():
                     return
                 if not poll_mode:
-                    poll_mode = True
+                    poll_mode, polls = True, 0
                     continue
-                delay = delays[min(attempt, len(delays) - 1)] if attempt < len(delays) else 30
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                 attempt += 1
                 message = self.bridge.safe_error(error, "Polling timed out")
             except Exception as error:
@@ -551,10 +717,13 @@ class SubscriptionWorker(threading.Thread):
                     self.response = None
                 if self.stop_event.is_set() or self.bridge.stop_event.is_set():
                     return
-                delay = delays[min(attempt, len(delays) - 1)] if attempt < len(delays) else 30
+                delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
                 attempt += 1
                 message = self.bridge.safe_error(error, "Connection lost")
-            jittered = min(60.0, delay * random.uniform(0.85, 1.15))
+            # A server-requested Retry-After is a floor that neither jitter nor
+            # the cap may undercut.
+            jittered = max(retry_after, min(MAX_RETRY_DELAY, delay * random.uniform(0.85, 1.15)))
+            retry_after = 0.0
             self.bridge.set_server_status(server_id, "backoff", message)
             self.stop_event.wait(jittered)
 
@@ -576,6 +745,10 @@ class Bridge:
         self.toast_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ntfy-task")
+        # One worker keeps toasts in arrival order while their image downloads
+        # stay off the subscription streams.
+        self.toast_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ntfy-toast")
+        self.request_pacer = RequestPacer()
         self.workers: dict[str, SubscriptionWorker] = {}
         self.statuses: dict[str, dict[str, str]] = {}
         self.inflight_actions: set[tuple[str, str]] = set()
@@ -683,8 +856,37 @@ class Bridge:
 
     @staticmethod
     def _run_notification_sender(argv: list[str]) -> None:
-        subprocess.run(argv, check=True, timeout=5, stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Toasts run on their own worker, so a shell that is slow to answer can
+        # take its time without holding up the subscription streams.
+        subprocess.run(argv, check=True, timeout=15, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    @staticmethod
+    def toast_failure_reason(error: BaseException) -> str:
+        if isinstance(error, subprocess.TimeoutExpired):
+            return f"no reply within {error.timeout:g} seconds"
+        if isinstance(error, subprocess.CalledProcessError):
+            stderr = error.stderr.decode("utf-8", "replace") if isinstance(error.stderr, bytes) else str(error.stderr or "")
+            first_line = next((line.strip() for line in stderr.splitlines() if line.strip()), "")
+            return first_line[:160] or f"exit status {error.returncode}"
+        return str(getattr(error, "strerror", "") or error or type(error).__name__)[:160]
+
+    def toast_image(self, server: dict[str, Any], row: dict[str, Any]) -> str:
+        attachment = row.get("attachment") or {}
+        url = str(attachment.get("url") or "")
+        content_type = str(attachment.get("type") or "")
+        expires = int(attachment.get("expires") or row.get("expires") or 0)
+        if not url or (content_type and not content_type.startswith("image/")):
+            return ""
+        if expires and expires <= int(time.time()):
+            return ""
+        try:
+            path = self.download_media(server, "attachment", url)
+        except Exception:
+            return ""
+        self.enforce_media_cache()
+        # Eviction removes unreferenced files first, which can include this one.
+        return str(path) if path.exists() else ""
 
     def send_native_toast(self, server: dict[str, Any], row: dict[str, Any]) -> None:
         with self.state_lock:
@@ -724,26 +926,29 @@ class Bridge:
         elif duration == "until-dismissed":
             urgency = "critical"
 
+        image = self.toast_image(current_server, row)
         argv = [
             "omarchy-notification-send",
             "--app-name", "Omartfy",
             "--glyph", "󰂚",
             "--urgency", urgency,
-            "--exec", "omarchy-shell shell summon dailen.omartfy '{}'",
+            *(["--image", image] if image else []),
             summary, body,
         ]
         if expire_time:
             argv.extend(["--expire-time", expire_time])
+        # --exec consumes the rest of the argv as the click command, so it goes last.
+        argv.extend(["--exec", "omarchy-shell", "shell", "summon", "dailen.omartfy", "{}"])
 
         try:
             self.notification_sender(argv)
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError) as error:
             with self.toast_lock:
                 should_emit = not self.toast_error_active
                 self.toast_error_active = True
             if should_emit:
                 self.emit({"event": "error", "fatal": False,
-                           "message": "Could not show desktop toast"})
+                           "message": "Could not show desktop toast: " + self.toast_failure_reason(error)})
         else:
             with self.toast_lock:
                 self.toast_error_active = False
@@ -895,7 +1100,7 @@ class Bridge:
         if emitted:
             self.emit(emitted)
         if native_toast:
-            self.send_native_toast(*native_toast)
+            self.toast_executor.submit(self.send_native_toast, *native_toast)
 
     def mark_read(self, server_id: str) -> None:
         changed: list[dict[str, Any]] = []
@@ -1273,6 +1478,8 @@ class Bridge:
             headers[name] = value
         data = None if not body_text else body_text.encode("utf-8")
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        if not request.has_header("User-agent"):
+            request.add_header("User-Agent", USER_AGENT)
         opener = urllib.request.build_opener(NoRedirect)
         try:
             with opener.open(request, timeout=15) as response:
@@ -1297,7 +1504,8 @@ class Bridge:
         try:
             candidate_id = str(candidate.get("id") or "") if isinstance(candidate, dict) else ""
             server = normalize_server(candidate, self.server_by_id(candidate_id) if candidate_id else None)
-            request = urllib.request.Request(stream_url(server, server["topics"], "latest", True), method="GET")
+            request = urllib.request.Request(stream_url(server, server["topics"], "latest", True), method="GET",
+                                             headers={"User-Agent": USER_AGENT})
             auth = authorization_header(server)
             if auth:
                 request.add_header("Authorization", auth)
@@ -1357,19 +1565,26 @@ class Bridge:
                        "ok": False, "path": "", "error": self.safe_error(error, "Could not load media")})
 
     def download_media(self, server: dict[str, Any], kind: str, source_url: str) -> Path:
+        deadline = time.monotonic() + 8
         url = validate_media_url(server, source_url)
         base_origin = origin_tuple(server["baseUrl"])
-        opener = urllib.request.build_opener(NoRedirect)
+        same_origin_opener = urllib.request.build_opener(NoRedirect)
         redirects = 0
-        deadline = time.monotonic() + 8
         response: Any = None
         while True:
             if time.monotonic() >= deadline:
                 raise MediaError("Media request timed out")
-            request = urllib.request.Request(url, method="GET")
-            auth = authorization_header(server)
-            if auth and origin_tuple(url) == base_origin:
-                request.add_header("Authorization", auth)
+            request = urllib.request.Request(url, method="GET", headers={"User-Agent": USER_AGENT})
+            origin = origin_tuple(url)
+            if origin == base_origin:
+                opener = same_origin_opener
+                auth = authorization_header(server)
+                if auth:
+                    request.add_header("Authorization", auth)
+            else:
+                _scheme, hostname, port = origin
+                address = resolve_public_address(hostname, port, deadline - time.monotonic())
+                opener = pinned_media_opener(address)
             try:
                 response = opener.open(request, timeout=max(0.1, deadline - time.monotonic()))
                 break
@@ -1514,6 +1729,7 @@ class Bridge:
         for server_id in list(self.workers):
             self.stop_worker(server_id)
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.toast_executor.shutdown(wait=True, cancel_futures=True)
         self.persist_state()
 
     def run(self) -> int:

@@ -19,6 +19,7 @@ CursorSurface {
 
   signal hovered(int rowIndex)
   signal activated(int rowIndex)
+  signal expandRequested(int rowIndex)
   signal markReadRequested(string notificationKey)
   signal deleteRequested(string notificationKey)
   signal actionRequested(string notificationKey, var action)
@@ -34,6 +35,10 @@ CursorSurface {
     ? service.mediaState(notification.notificationKey, "icon") : ({ state: "idle", text: "" })
   readonly property var attachmentMediaState: service
     ? service.mediaState(notification.notificationKey, "attachment") : ({ state: "idle", text: "" })
+  // Landscape images (video and article thumbnails) read better as a full-width
+  // card banner than squeezed into the icon slot; square avatars stay icons.
+  readonly property bool cardView: iconImage.status === Image.Ready
+    && iconImage.implicitWidth > iconImage.implicitHeight * 1.15
 
   function requestIcon() {
     if (root.visible && root.notification.icon && !root.notification.iconPath
@@ -80,12 +85,23 @@ CursorSurface {
     anchors.margins: Style.space(8)
     spacing: Style.space(7)
 
+    Image {
+      width: parent.width
+      height: visible ? Math.round(width * 9 / 16) : 0
+      visible: root.cardView
+      source: visible ? iconImage.source : ""
+      fillMode: Image.PreserveAspectCrop
+      asynchronous: true
+      clip: true
+    }
+
     Row {
       width: parent.width
-      spacing: Style.space(9)
+      spacing: root.cardView ? 0 : Style.space(9)
 
       Item {
-        width: Style.space(40)
+        visible: !root.cardView
+        width: visible ? Style.space(40) : 0
         height: Style.space(40)
 
         Image {
@@ -109,7 +125,7 @@ CursorSurface {
       }
 
       Column {
-        width: parent.width - Style.space(49)
+        width: parent.width - (root.cardView ? 0 : Style.space(49))
         spacing: Style.space(2)
 
         Row {
@@ -143,6 +159,17 @@ CursorSurface {
             id: rowActions
             visible: root.current
             spacing: Style.space(1)
+
+            // Tapping a row with a link opens it, so expanding needs its own control.
+            PanelActionButton {
+              visible: !!root.notification.click
+              size: Style.space(20)
+              iconText: root.expanded ? "⌃" : "⌄"
+              tooltipText: root.expanded ? "Collapse" : "Expand"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.expandRequested(root.rowIndex)
+            }
 
             PanelActionButton {
               size: Style.space(20)
@@ -232,7 +259,8 @@ CursorSurface {
         source: root.notification.attachmentPath ? Util.fileUrl(root.notification.attachmentPath) : ""
         fillMode: Image.PreserveAspectFit
         asynchronous: true
-        visible: status === Image.Ready
+        // The card banner already shows it when icon and attachment are one image.
+        visible: status === Image.Ready && !(root.cardView && root.attachment.url === root.notification.icon)
       }
 
       Text {
@@ -269,38 +297,12 @@ CursorSurface {
         }
       }
 
-      Flow {
-        width: parent.width
-        height: visible ? childrenRect.height : 0
-        visible: root.notificationActions.length > 0
-        spacing: Style.space(7)
-
-        Repeater {
-          model: root.notificationActions
-          delegate: Button {
-            required property var modelData
-            readonly property var actionState: root.service
-              ? root.service.actionState(root.notification.notificationKey, modelData.id)
-              : ({ state: "idle", text: "" })
-            readonly property bool trusted: modelData.action !== "http" || root.allowHttpActions
-
-            text: (actionState.state === "working" ? "Working"
-              : (actionState.state === "done" ? "Done" : String(modelData.label || "Action"))).toUpperCase()
-            enabled: root.actionsEnabled && trusted && actionState.state !== "working"
-            onClicked: root.actionRequested(root.notification.notificationKey, modelData)
-          }
-        }
-      }
-
       Repeater {
         model: root.notificationActions
         delegate: Column {
           required property var modelData
           width: parent.width
           spacing: Style.space(2)
-          readonly property var actionState: root.service
-            ? root.service.actionState(root.notification.notificationKey, modelData.id)
-            : ({ state: "idle", text: "" })
           readonly property bool trusted: modelData.action !== "http" || root.allowHttpActions
 
           Text {
@@ -311,17 +313,50 @@ CursorSurface {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
-
-          Text {
-            visible: parent.actionState.state === "error"
-            text: parent.actionState.text
-            color: Color.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
-            width: parent.width
-          }
         }
+      }
+    }
+
+    // Publisher actions stay on the card, as on Android, so they work without
+    // expanding the row. Untrusted HTTP actions stay clickable and report why
+    // they were refused inline, like any other failure.
+    Flow {
+      width: parent.width
+      visible: root.notificationActions.length > 0
+      spacing: Style.space(7)
+
+      Repeater {
+        model: root.notificationActions
+        delegate: Button {
+          required property var modelData
+          readonly property var actionState: root.service
+            ? root.service.actionState(root.notification.notificationKey, modelData.id)
+            : ({ state: "idle", text: "" })
+
+          text: (actionState.state === "working" ? "Working"
+            : (actionState.state === "done" ? "Done" : String(modelData.label || "Action"))).toUpperCase()
+          enabled: root.actionsEnabled && actionState.state !== "working"
+          onClicked: root.actionRequested(root.notification.notificationKey, modelData)
+        }
+      }
+    }
+
+    Repeater {
+      model: root.notificationActions
+      delegate: Text {
+        required property var modelData
+        readonly property var actionState: root.service
+          ? root.service.actionState(root.notification.notificationKey, modelData.id)
+          : ({ state: "idle", text: "" })
+        width: parent.width
+        visible: actionState.state === "error"
+        text: String(modelData.label || "Action") + " failed: " + actionState.text
+        color: Color.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.Wrap
+        maximumLineCount: 2
+        elide: Text.ElideRight
       }
     }
   }

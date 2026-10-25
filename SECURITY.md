@@ -24,9 +24,9 @@ Omartfy is an unsandboxed Omarchy shell plugin and runs with the current user's 
 - Credentialed non-loopback plain HTTP requires explicit acknowledgement.
 - Explicit, user-activated view and attachment destinations are restricted to validated HTTP(S) URLs.
 - Publisher-supplied HTTP actions are disabled by default per server, require user activation, and do not follow redirects or retry.
-- Automatic icon and attachment-preview requests, including every redirect, must retain the configured server's exact scheme, host, and effective port.
+- Automatic icon and attachment-preview requests, including every redirect, must retain the configured server's exact scheme, host, and effective port, unless the server's off-by-default **Load images from other hosts** option is enabled. Even then, other hosts must use HTTPS and resolve only to public addresses, so the option never reaches loopback or private-network services; each redirect is checked the same way. Size, format, dimension, redirect-count, and timeout limits apply either way, and credentials are only ever sent to the configured origin.
 - Notification bodies render as plain text; Omartfy does not render remote HTML, Markdown, SVG, audio, or video.
-- Native desktop toasts are opt-in, dispatch via static Omarchy summon commands, and never pass remote URLs, media paths, or credentials in notification arguments.
+- Native desktop toasts are opt-in, dispatch via static Omarchy summon commands, and never pass remote URLs or credentials in notification arguments; an image attachment is passed only as the path of its validated local cache file.
 
 Topic confidentiality and authorization remain the ntfy server administrator's responsibility. An unprotected topic name can function as a public address.
 

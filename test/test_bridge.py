@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.parse
 from pathlib import Path
 
@@ -224,6 +226,86 @@ class BridgeCase(unittest.TestCase):
             self.assertTrue(wait_until(lambda: other.statuses.get(wrong["id"], {}).get("state") == "auth-error"))
             self.assertNotIn("wrong", self.output.getvalue())
 
+    def test_request_pacer_shares_one_budget_per_origin(self):
+        now = [0.0]
+        pacer = bridge_module.RequestPacer(burst=3, refill_seconds=10.0, clock=lambda: now[0])
+        ntfy = ("https", "ntfy.sh", 443)
+        self.assertEqual([pacer.reserve(ntfy) for _ in range(3)], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(pacer.reserve(ntfy), 10.0)
+        self.assertAlmostEqual(pacer.reserve(ntfy), 20.0)
+        self.assertEqual(pacer.reserve(("https", "home.example", 443)), 0.0)
+        now[0] = 60.0
+        self.assertEqual(pacer.reserve(ntfy), 0.0)
+
+    def run_worker_until(self, bridge, server, responses, waits_wanted):
+        """Drive one worker through scripted responses, recording URLs and backoff waits."""
+        urls, waits = [], []
+        worker = SubscriptionWorker(bridge, server)
+
+        def fake_urlopen(request, timeout=None):
+            urls.append(request.full_url)
+            outcome = responses(len(urls))
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        def fake_wait(seconds=None):
+            waits.append(seconds)
+            if len(waits) >= waits_wanted:
+                worker.stop_event.set()
+            return worker.stop_event.is_set()
+
+        bridge.urlopen = fake_urlopen
+        worker.stop_event.wait = fake_wait
+        worker.run()
+        return urls, waits
+
+    def test_rate_limits_back_off_hard_and_polling_returns_to_streaming(self):
+        server = normalize_server({"label": "Cloud", "baseUrl": "https://ntfy.example", "topics": ["alerts"]})
+        bridge = self.make_bridge({"version": 1, "servers": [server]})
+        bridge.request_pacer = bridge_module.RequestPacer(burst=1000)
+
+        def limited(_count):
+            return urllib.error.HTTPError("https://ntfy.example", 429, "Too Many Requests", {}, None)
+        _urls, waits = self.run_worker_until(bridge, server, limited, 6)
+        self.assertGreaterEqual(min(waits), 60 * 0.85)
+        self.assertGreater(waits[4], waits[0] * 8)
+        self.assertLessEqual(max(waits), bridge_module.MAX_RETRY_DELAY)
+
+        def retry_after(_count):
+            return urllib.error.HTTPError("https://ntfy.example", 429, "Too Many Requests",
+                                          {"Retry-After": "400"}, None)
+        _urls, waits = self.run_worker_until(bridge, server, retry_after, 3)
+        self.assertTrue(all(wait >= 400 for wait in waits))
+
+        def long_retry_after(_count):
+            return urllib.error.HTTPError("https://ntfy.example", 429, "Too Many Requests",
+                                          {"Retry-After": "3600"}, None)
+        _urls, waits = self.run_worker_until(bridge, server, long_retry_after, 1)
+        self.assertEqual(waits[0], 3600)
+
+        # Non-finite or absurd values must not overflow the wait and kill the worker.
+        for header, low, high in (("inf", 60 * 0.85, bridge_module.MAX_RETRY_DELAY),
+                                  ("nan", 60 * 0.85, bridge_module.MAX_RETRY_DELAY),
+                                  ("-5", 60 * 0.85, bridge_module.MAX_RETRY_DELAY),
+                                  ("1e12", bridge_module.MAX_RETRY_AFTER, bridge_module.MAX_RETRY_AFTER)):
+            def odd_retry_after(_count, header=header):
+                return urllib.error.HTTPError("https://ntfy.example", 429, "Too Many Requests",
+                                              {"Retry-After": header}, None)
+            _urls, waits = self.run_worker_until(bridge, server, odd_retry_after, 1)
+            self.assertTrue(low <= waits[0] <= high, (header, waits[0]))
+
+        # A stream timeout falls back to polling, and streaming is retried later
+        # instead of polling forever.
+        def stream_times_out(count):
+            return TimeoutError("timed out") if count == 1 else io.BytesIO(b"")
+        urls, _waits = self.run_worker_until(bridge, server, stream_times_out,
+                                             bridge_module.POLLS_BEFORE_STREAM_RETRY + 1)
+        polled = ["poll=1" in url for url in urls]
+        self.assertFalse(polled[0])
+        self.assertTrue(all(polled[1:bridge_module.POLLS_BEFORE_STREAM_RETRY + 1]))
+        self.assertFalse(polled[bridge_module.POLLS_BEFORE_STREAM_RETRY + 1])
+
     def test_buffered_stream_bootstraps_and_falls_back_to_polling(self):
         old_timeout = bridge_module.STREAM_TIMEOUT_SECONDS
         old_interval = bridge_module.POLL_INTERVAL_SECONDS
@@ -280,6 +362,9 @@ class BridgeCase(unittest.TestCase):
             self.assertEqual(allowed["status"], 204)
             self.assertEqual(target.server.state.actions[-1]["method"], "POST")
             self.assertEqual(target.server.state.actions[-1]["body"], '{"ok":true}')
+            # Cloudflare refuses Python's default User-Agent with error 1010.
+            self.assertEqual(target.server.state.actions[-1]["headers"].get("User-Agent"), bridge_module.USER_AGENT)
+            self.assertTrue(bridge_module.USER_AGENT.startswith("Omartfy/"))
 
     def test_media_allows_only_configured_origin_and_rejects_cross_origin_redirects(self):
         with RunningServer("media-token") as source, RunningServer() as target:
@@ -463,9 +548,11 @@ class BridgeCase(unittest.TestCase):
 
         live = {"event": "message", "id": "live", "topic": "alerts", "message": "new"}
         worker._consume(io.BytesIO((json.dumps(live) + "\n").encode()), True, True)
+        bridge.toast_executor.submit(lambda: None).result()
         self.assertEqual(len(sent), 1)
         bridge.apply_event(server["id"], live, show_toast=True)
         bridge.apply_event(server["id"], {"event": "open", "id": "open"}, show_toast=True)
+        bridge.toast_executor.submit(lambda: None).result()
         self.assertEqual(len(sent), 1)
 
         bridge.set_mute(-1)
@@ -492,6 +579,7 @@ class BridgeCase(unittest.TestCase):
         bridge.apply_event(server["id"], {
             "event": "message", "id": "disabled", "topic": "alerts", "message": "off",
         }, show_toast=True)
+        bridge.toast_executor.submit(lambda: None).result()
         self.assertEqual(len(sent), 1)
 
     def test_native_toast_argv_is_bounded_escaped_static_and_honors_duration(self):
@@ -516,18 +604,18 @@ class BridgeCase(unittest.TestCase):
         })
         bridge.send_native_toast(server, row)
         argv = sent.pop()
-        self.assertEqual(argv[:9], [
+        self.assertEqual(argv[:7], [
             "omarchy-notification-send",
             "--app-name", "Omartfy",
             "--glyph", "󰂚",
             "--urgency", "low",
-            "--exec", "omarchy-shell shell summon dailen.omartfy '{}'",
         ])
-        self.assertTrue(argv[9].startswith(" --exec "))
-        self.assertIn("&lt;b&gt;&amp;&quot;", argv[9])
-        self.assertIn("Hello &lt;script&gt;&amp;", argv[10])
-        self.assertLessEqual(len(bridge_module.html.unescape(argv[9]).lstrip()), 160)
-        self.assertLessEqual(len(bridge_module.html.unescape(argv[10])), 500)
+        self.assertEqual(argv[-6:], ["--exec", "omarchy-shell", "shell", "summon", "dailen.omartfy", "{}"])
+        self.assertTrue(argv[7].startswith(" --exec "))
+        self.assertIn("&lt;b&gt;&amp;&quot;", argv[7])
+        self.assertIn("Hello &lt;script&gt;&amp;", argv[8])
+        self.assertLessEqual(len(bridge_module.html.unescape(argv[7]).lstrip()), 160)
+        self.assertLessEqual(len(bridge_module.html.unescape(argv[8])), 500)
         joined = "\0".join(argv)
         for protected in (
             "private-token", "https://click.invalid", "https://icon.invalid",
@@ -545,7 +633,7 @@ class BridgeCase(unittest.TestCase):
             bridge.send_native_toast(server, row)
             current = sent.pop()
             self.assertEqual(current[6], urgency)
-            self.assertEqual(current[-2:], ["--expire-time", timeout])
+            self.assertEqual(current[9:11], ["--expire-time", timeout])
 
         bridge.config["toasts"]["duration"] = "until-dismissed"
         bridge.send_native_toast(server, row)
@@ -566,8 +654,15 @@ class BridgeCase(unittest.TestCase):
         bridge.notification_sender = fail
         bridge.send_native_toast(server, row)
         bridge.send_native_toast(server, row)
+        self.assertIn("Could not show desktop toast: sender unavailable",
+                      [event.get("message") for event in self.events()])
+        reason = bridge_module.Bridge.toast_failure_reason
+        self.assertEqual(reason(subprocess.TimeoutExpired(["x"], 15)), "no reply within 15 seconds")
+        self.assertEqual(reason(subprocess.CalledProcessError(1, ["x"], stderr=b"\nUnknown option: -z\nusage")),
+                         "Unknown option: -z")
+        self.assertEqual(reason(subprocess.CalledProcessError(2, ["x"], stderr=b"")), "exit status 2")
         errors = [event for event in self.events()
-                  if event.get("message") == "Could not show desktop toast"]
+                  if str(event.get("message", "")).startswith("Could not show desktop toast")]
         self.assertEqual(len(errors), 1)
         bridge.notification_sender = sent.append
         bridge.send_native_toast(server, row)
@@ -575,7 +670,7 @@ class BridgeCase(unittest.TestCase):
         bridge.notification_sender = fail
         bridge.send_native_toast(server, row)
         errors = [event for event in self.events()
-                  if event.get("message") == "Could not show desktop toast"]
+                  if str(event.get("message", "")).startswith("Could not show desktop toast")]
         bridge.notification_sender = sent.append
         malicious_row = bridge.normalize_message(server["id"], {
             "event": "message", "id": "inject", "topic": "alerts", "priority": 3,
@@ -589,12 +684,110 @@ class BridgeCase(unittest.TestCase):
         self.assertIn("--app-name=evil", joined)
         self.assertIn("--expire-time=999999", joined)
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", joined)
-        body_arg = injected[10]
+        body_arg = injected[8]
         self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body_arg)
         self.assertEqual(bridge_module.html.unescape(body_arg).splitlines()[1], "--expire-time=999999 <script>alert(1)</script>")
-        summary_arg = injected[9]
+        summary_arg = injected[7]
         self.assertTrue(summary_arg.startswith(" --icon="))
         self.assertEqual(len(errors), 2)
+
+    def test_external_media_is_opt_in_https_public_only_and_never_gets_credentials(self):
+        with RunningServer("media-token") as source, RunningServer() as open_host, \
+                RunningServer("media-token") as guarded_host:
+            server = normalize_server({"label": "Media", "baseUrl": source.url, "topics": ["alerts"],
+                                       "enabled": False, "auth": {"type": "token", "secret": "media-token"}})
+            self.assertFalse(server["allowExternalMedia"])
+            self.assertFalse(public_server(server)["allowExternalMedia"])
+            bridge = self.make_bridge({"version": 1, "servers": [server]})
+            with self.assertRaisesRegex(MediaError, "configured server origin"):
+                bridge.download_media(server, "icon", open_host.url + "/icon.png")
+
+            server = normalize_server({**server, "allowExternalMedia": True})
+            self.assertTrue(public_server(server)["allowExternalMedia"])
+            # Same-origin media keeps working even though the server is local.
+            self.assertTrue(bridge.download_media(server, "icon", source.url + "/icon.png").exists())
+            with self.assertRaisesRegex(MediaError, "HTTPS"):
+                bridge.download_media(server, "icon", open_host.url + "/icon.png")
+            for private in ("https://127.0.0.1/a.png", "https://localhost/a.png", "https://10.1.2.3/a.png",
+                            "https://192.168.1.5/a.png", "https://100.64.0.1/a.png", "https://[::1]/a.png",
+                            "https://169.254.169.254/a.png"):
+                with self.assertRaisesRegex(MediaError, "public addresses"):
+                    bridge.download_media(server, "icon", private)
+            to_local = source.url + "/redirect?" + urllib.parse.urlencode({"to": "https://127.0.0.1/a.png"})
+            with self.assertRaisesRegex(MediaError, "public addresses"):
+                bridge.download_media(server, "icon", to_local)
+            self.assertTrue(bridge_module.resolves_to_public_addresses("8.8.8.8", 443))
+            with unittest.mock.patch.object(bridge_module.socket, "getaddrinfo",
+                                            side_effect=OSError("no such host")):
+                self.assertFalse(bridge_module.resolves_to_public_addresses("invalid.invalid", 443))
+
+            # With the host policy out of the way, the server's token still never
+            # reaches another host: one that demands it gets no header and refuses.
+            # The pinned address is what gets connected to, not a fresh DNS answer:
+            # "media.invalid" never resolves, yet the fetch reaches the mock host.
+            open_port = urllib.parse.urlsplit(open_host.url).port
+            guarded_port = urllib.parse.urlsplit(guarded_host.url).port
+            with unittest.mock.patch.object(bridge_module, "validate_media_url",
+                                            lambda _server, value: bridge_module.validate_web_url(value)), \
+                    unittest.mock.patch.object(bridge_module, "resolve_public_address",
+                                               lambda _host, _port, _timeout: "127.0.0.1"), \
+                    unittest.mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9"}):
+                self.assertTrue(bridge.download_media(
+                    server, "icon", f"http://media.invalid:{open_port}/icon.png").exists())
+                with self.assertRaisesRegex(MediaError, "returned 401"):
+                    bridge.download_media(server, "icon", f"http://media.invalid:{guarded_port}/icon.png")
+
+            def slow_lookup(*_args, **_kwargs):
+                time.sleep(2)
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+            with unittest.mock.patch.object(bridge_module.socket, "getaddrinfo", slow_lookup):
+                started = time.monotonic()
+                with self.assertRaisesRegex(MediaError, "lookup timed out"):
+                    bridge_module.resolve_public_address("slow.example", 443, 0.2)
+                self.assertLess(time.monotonic() - started, 1.0)
+            mixed = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443)),
+                     (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))]
+            with unittest.mock.patch.object(bridge_module.socket, "getaddrinfo", return_value=mixed):
+                with self.assertRaisesRegex(MediaError, "public addresses"):
+                    bridge_module.resolve_public_address("mixed.example", 443, 1.0)
+
+    def test_native_toast_shows_same_origin_image_attachment(self):
+        with RunningServer("media-token") as source:
+            sent = []
+            server = normalize_server({"label": "Media", "baseUrl": source.url + "/proxy", "topics": ["alerts"],
+                                       "enabled": False, "auth": {"type": "token", "secret": "media-token"}})
+            bridge = self.make_bridge({
+                "version": 1,
+                "toasts": {"enabled": True, "duration": "default"},
+                "servers": [server],
+            }, notification_sender=sent.append)
+            bridge.config["servers"][0]["enabled"] = True
+            row = bridge.normalize_message(server["id"], {
+                "event": "message", "id": "picture", "topic": "alerts", "title": "Snapshot",
+                "attachment": {"name": "icon.png", "type": "image/png", "url": source.url + "/icon.png"},
+            })
+            bridge.send_native_toast(server, row)
+            argv = sent.pop()
+            image = argv[argv.index("--image") + 1]
+            self.assertLess(argv.index("--image"), argv.index("--exec"))
+            self.assertTrue(Path(image).exists())
+            self.assertTrue(Path(image).is_relative_to(bridge.media_dir))
+
+            for attachment in (
+                {"name": "notes.pdf", "type": "application/pdf", "url": source.url + "/icon.png"},
+                {"name": "old.png", "type": "image/png", "url": source.url + "/icon.png", "expires": 1},
+                {"name": "bad.png", "type": "image/png", "url": source.url + "/bad-media"},
+            ):
+                row["attachment"] = attachment
+                bridge.send_native_toast(server, row)
+                self.assertNotIn("--image", sent.pop())
+
+            # A cache already full of referenced media evicts the new, unreferenced
+            # toast image straight away; the toast must not point at a missing file.
+            row["attachment"] = {"name": "icon.png", "type": "image/png", "url": source.url + "/icon.png"}
+            bridge.enforce_media_cache = lambda: [path.unlink() for path in bridge.media_dir.iterdir()]
+            bridge.send_native_toast(server, row)
+            self.assertNotIn("--image", sent.pop())
 
     def test_save_delete_results_and_malformed_config_protection(self):
         bridge = self.make_bridge({"version": 1, "servers": []})
