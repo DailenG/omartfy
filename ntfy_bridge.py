@@ -1202,7 +1202,10 @@ class Bridge:
                     }
                     emitted = {"event": "notification_upsert", "notification": qml_notification(row)}
                     server = self.server_by_id(server_id)
-                    if old is None and show_toast and server is not None:
+                    if (old is None and show_toast and server is not None
+                            and self.config["toasts"]["enabled"]
+                            and server["enabled"] and server["showToasts"]
+                            and self.current_mute_until() == 0):
                         native_toast = (server, row)
             else:
                 topic = str(event.get("topic") or "")
